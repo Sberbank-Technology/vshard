@@ -1485,7 +1485,8 @@ local function storage_cfg(cfg, this_replica_uuid)
     --
     -- If a master role of the replica is not changed, then
     -- 'read_only' can be set right here.
-    cfg.listen = cfg.listen or this_replica.uri
+	local uri = luri.parse(this_replica.uri)
+    cfg.listen = cfg.listen or tonumber(uri.service)
     if cfg.replication == nil and this_replicaset.master and not is_master then
         cfg.replication = {this_replicaset.master.uri}
     else
@@ -1534,7 +1535,6 @@ local function storage_cfg(cfg, this_replica_uuid)
     end
 
     log.info("Box has been configured")
-    local uri = luri.parse(this_replica.uri)
     box.once("vshard:storage:1", storage_schema_v1, uri.login, uri.password)
 
     M.replicasets = new_replicasets
