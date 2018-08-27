@@ -1,16 +1,6 @@
 test_run = require('test_run').new()
 ---
 ...
-test_run:cmd("push filter '.*/init.lua.*[0-9]+: ' to ''")
----
-- true
-...
-netbox = require('net.box')
----
-...
-fiber = require('fiber')
----
-...
 REPLICASET_1 = { 'storage_1_a', 'storage_1_b' }
 ---
 ...
@@ -38,9 +28,8 @@ util.wait_master(test_run, REPLICASET_2, 'storage_2_a')
 -- down master. Router discovery fiber must use replica to find
 -- buckets.
 --
-test_run:cmd('switch storage_1_a')
+_ = test_run:switch('storage_1_a')
 ---
-- true
 ...
 _bucket = box.space._bucket
 ---
@@ -48,26 +37,20 @@ _bucket = box.space._bucket
 for i = 1, 10 do _bucket:replace{i, vshard.consts.BUCKET.ACTIVE} end
 ---
 ...
-test_run:cmd('switch storage_1_b')
+_ = test_run:switch('storage_1_b')
 ---
-- true
 ...
 _bucket = box.space._bucket
----
-...
-fiber = require('fiber')
 ---
 ...
 while _bucket:count() ~= 10 do fiber.sleep(0.1) end
 ---
 ...
-test_run:cmd("create server router_1 with script='router/router_1.lua'")
+_ = test_run:cmd("create server router_1 with script='router/router_1.lua'")
 ---
-- true
 ...
-test_run:cmd("start server router_1")
+_ = test_run:cmd("start server router_1")
 ---
-- true
 ...
 -- Break a connection to a master.
 _ = test_run:cmd('stop server storage_1_a')
@@ -76,12 +59,14 @@ _ = test_run:cmd('stop server storage_1_a')
 _ = test_run:switch('router_1')
 ---
 ...
-reps = vshard.router.internal.replicasets
+util = require('util')
 ---
 ...
-test_run:cmd("setopt delimiter ';'")
+reps = vshard.router.static.replicasets
 ---
-- true
+...
+_ = test_run:cmd("setopt delimiter ';'")
+---
 ...
 function is_disconnected()
     for i, rep in pairs(reps) do
@@ -95,16 +80,15 @@ end;
 ...
 function count_known_buckets()
     local known_buckets = 0
-    for _, id in pairs(vshard.router.internal.route_map) do
+    for _, id in pairs(vshard.router.static.route_map) do
         known_buckets = known_buckets + 1
     end
     return known_buckets
 end;
 ---
 ...
-test_run:cmd("setopt delimiter ''");
+_ = test_run:cmd("setopt delimiter ''");
 ---
-- true
 ...
 count_known_buckets()
 ---
@@ -124,10 +108,7 @@ is_disconnected()
 ...
 -- Wait until replica is connected to test alerts on unavailable
 -- master.
-fiber = require('fiber')
----
-...
-while vshard.router.internal.replicasets[replicasets[1]].replica == nil do fiber.sleep(0.1) end
+while vshard.router.static.replicasets[util.replicasets[1]].replica == nil do fiber.sleep(0.1) end
 ---
 ...
 vshard.router.info()
@@ -139,6 +120,8 @@ vshard.router.info()
         status: available
         uri: storage@127.0.0.1:3303
         uuid: 1e02ae8a-afc0-4e91-ba34-843a356b8ed7
+      bucket:
+        available_rw: 0
       uuid: ac522f65-aa94-4134-9f64-51ee384f1a54
       master: *0
     cbf06940-0790-498b-948d-042b62cf3d29:
@@ -147,6 +130,8 @@ vshard.router.info()
         status: available
         uri: storage@127.0.0.1:3302
         uuid: 3de2e3e1-9ebe-4d0d-abb1-26d301b84633
+      bucket:
+        available_ro: 10
       uuid: cbf06940-0790-498b-948d-042b62cf3d29
       master:
         network_timeout: 0.5
@@ -170,9 +155,6 @@ vshard.router.info()
 _ = test_run:cmd('start server storage_1_a')
 ---
 ...
-fiber = require('fiber')
----
-...
 max_iters = 1000
 ---
 ...
@@ -187,16 +169,14 @@ is_disconnected()
 ---
 - false
 ...
-_ = test_run:cmd("switch default")
+_ = test_run:switch("default")
 ---
 ...
-test_run:cmd('stop server router_1')
+_ = test_run:cmd('stop server router_1')
 ---
-- true
 ...
-test_run:cmd('cleanup server router_1')
+_ = test_run:cmd('cleanup server router_1')
 ---
-- true
 ...
 test_run:drop_cluster(REPLICASET_2)
 ---

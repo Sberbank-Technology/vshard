@@ -6,10 +6,11 @@ test_run:create_cluster(REPLICASET_2, 'storage')
 util = require('util')
 util.wait_master(test_run, REPLICASET_1, 'storage_1_a')
 util.wait_master(test_run, REPLICASET_2, 'storage_2_a')
-test_run:cmd("create server router_1 with script='router/router_1.lua'")
-test_run:cmd("start server router_1")
+util.map_evals(test_run, {REPLICASET_1, REPLICASET_2}, 'bootstrap_storage(\'memtx\')')
+_ = test_run:cmd("create server router_1 with script='router/router_1.lua'")
+_ = test_run:cmd("start server router_1")
 
-test_run:switch('router_1')
+_ = test_run:switch('router_1')
 fiber = require('fiber')
 vshard.router.bootstrap()
 
@@ -23,7 +24,7 @@ while test_run:grep_log('router_1', 'buckets: was 0, became 1500') == nil do fib
 
 assert(rawget(_G, '__module_vshard_router') ~= nil)
 vshard.router.module_version()
-test_run:cmd("setopt delimiter ';'")
+_ = test_run:cmd("setopt delimiter ';'")
 function check_reloaded()
 	for k, v in pairs(old_internal) do
 		if v == vshard.router.internal[k] then
@@ -47,7 +48,7 @@ function copy_functions(t)
 	end
 	return ret
 end;
-test_run:cmd("setopt delimiter ''");
+_ = test_run:cmd("setopt delimiter ''");
 --
 -- Simple reload. All functions are reloaded and they have
 -- another pointers in vshard.router.internal.
@@ -59,8 +60,8 @@ vshard.router.module_version()
 
 check_reloaded()
 
-while test_run:grep_log('router_1', 'Failover has been reloaded') == nil do fiber.sleep(0.1) end
-while test_run:grep_log('router_1', 'Discovery has been reloaded') == nil do fiber.sleep(0.1) vshard.router.discovery_wakeup() end
+while test_run:grep_log('router_1', 'failover_f has been started') == nil do fiber.sleep(0.1) end
+while test_run:grep_log('router_1', 'discovery_f has been started') == nil do fiber.sleep(0.1) vshard.router.discovery_wakeup() end
 
 check_reloaded()
 
@@ -86,9 +87,44 @@ _ = require('vshard.router')
 vshard.router.module_version()
 check_reloaded()
 
-test_run:switch('default')
-test_run:cmd('stop server router_1')
-test_run:cmd('cleanup server router_1')
+--
+-- Outdate old replicaset and replica objects.
+--
+rs = vshard.router.route(1)
+rs:callro('echo', {'some_data'})
+package.loaded["vshard.router"] = nil
+_ = require('vshard.router')
+-- Make sure outdate async task has had cpu time.
+while not rs.is_outdated do fiber.sleep(0.001) end
+rs.callro(rs, 'echo', {'some_data'})
+vshard.router = require('vshard.router')
+rs = vshard.router.route(1)
+rs:callro('echo', {'some_data'})
+-- Test `connection_outdate_delay`.
+old_connection_delay = cfg.connection_outdate_delay
+cfg.connection_outdate_delay = 0.3
+vshard.router.cfg(cfg)
+cfg.connection_outdate_delay = old_connection_delay
+vshard.router.static.connection_outdate_delay = nil
+rs_new = vshard.router.route(1)
+rs_old = rs
+_, replica_old = next(rs_old.replicas)
+rs_new:callro('echo', {'some_data'})
+-- Check old objets are still valid.
+rs_old:callro('echo', {'some_data'})
+replica_old.conn ~= nil
+fiber.sleep(0.2)
+rs_old:callro('echo', {'some_data'})
+replica_old.conn ~= nil
+replica_old.is_outdated == nil
+fiber.sleep(0.2)
+rs_old:callro('echo', {'some_data'})
+replica_old.conn == nil
+replica_old.is_outdated == true
+rs_new:callro('echo', {'some_data'})
+
+_ = test_run:switch('default')
+_ = test_run:cmd('stop server router_1')
+_ = test_run:cmd('cleanup server router_1')
 test_run:drop_cluster(REPLICASET_2)
 test_run:drop_cluster(REPLICASET_1)
-test_run:cmd('clear filter')

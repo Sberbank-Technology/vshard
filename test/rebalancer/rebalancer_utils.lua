@@ -2,7 +2,7 @@ local write_iterations = 0
 local read_iterations = 0
 local write_fiber = 'none'
 local read_fiber = 'none'
-local bucket_count = 100
+local bucket_count = 200
 
 local log = require('log')
 
@@ -32,7 +32,10 @@ local function do_read_load()
 				vshard.router.call(bucket, 'read', 'do_select',
 						   {{read_iterations}},
 						   {timeout = 100})
-			assert(tuples)
+			if not tuples then
+				log.info('Error during read loading: %s', err)
+				tuples = {}
+			end
 		end
 		assert(tuples[1][1] == read_iterations)
 		assert(tuples[1][2] == bucket)
@@ -71,5 +74,4 @@ return {
 	stop_loading = stop_loading,
 	start_loading = start_loading,
 	check_loading_result = check_loading_result,
-	set_bucket_count = function(new_count) bucket_count = new_count end,
 }

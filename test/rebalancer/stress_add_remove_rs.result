@@ -10,6 +10,9 @@ REPLICASET_2 = { 'box_2_a', 'box_2_b' }
 REPLICASET_3 = { 'box_3_a', 'box_3_b' }
 ---
 ...
+engine = test_run:get_cfg('engine')
+---
+...
 test_run:create_cluster(REPLICASET_1, 'rebalancer')
 ---
 ...
@@ -23,6 +26,9 @@ util.wait_master(test_run, REPLICASET_1, 'box_1_a')
 ---
 ...
 util.wait_master(test_run, REPLICASET_2, 'box_2_a')
+---
+...
+util.map_evals(test_run, {REPLICASET_1, REPLICASET_2}, 'bootstrap_storage(\'%s\')', engine)
 ---
 ...
 test_run:cmd('create server router_1 with script="rebalancer/router_1.lua"')
@@ -50,17 +56,14 @@ test_run:switch('box_2_a')
 ---
 - true
 ...
-for i = 1, 100 do box.space._bucket:replace{i, vshard.consts.BUCKET.ACTIVE} end
+for i = 1, 200 do box.space._bucket:replace{i, vshard.consts.BUCKET.ACTIVE} end
 ---
 ...
 test_run:switch('box_1_a')
 ---
 - true
 ...
-cfg.bucket_count = 100
----
-...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_a)
 ---
 ...
 wait_rebalancer_state('The cluster is balanced ok', test_run)
@@ -68,7 +71,7 @@ wait_rebalancer_state('The cluster is balanced ok', test_run)
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 50
+- 100
 ...
 --
 -- Test the first case of described above.
@@ -78,9 +81,6 @@ test_run:switch('router_1')
 - true
 ...
 util = require('rebalancer_utils')
----
-...
-cfg.bucket_count = 100
 ---
 ...
 vshard.router.cfg(cfg)
@@ -102,6 +102,9 @@ test_run:create_cluster(REPLICASET_3, 'rebalancer')
 util.wait_master(test_run, REPLICASET_3, 'box_3_a')
 ---
 ...
+util.map_evals(test_run, {REPLICASET_3}, 'bootstrap_storage(\'%s\')', engine)
+---
+...
 test_run:switch('box_1_a')
 ---
 - true
@@ -109,7 +112,7 @@ test_run:switch('box_1_a')
 add_replicaset()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -122,7 +125,7 @@ test_run:switch('box_1_b')
 add_replicaset()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_b)
 ---
 ...
 fiber.sleep(0.5)
@@ -135,7 +138,7 @@ test_run:switch('box_2_a')
 add_replicaset()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_2_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_2_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -148,7 +151,7 @@ test_run:switch('box_2_b')
 add_replicaset()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_2_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_2_b)
 ---
 ...
 fiber.sleep(0.5)
@@ -176,7 +179,7 @@ wait_rebalancer_state('The cluster is balanced ok', test_run)
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 33
+- 66
 ...
 test_run:switch('router_1')
 ---
@@ -195,7 +198,7 @@ test_run:switch('box_1_a')
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 33
+- 66
 ...
 check_consistency()
 ---
@@ -207,7 +210,7 @@ test_run:switch('box_2_a')
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 34
+- 67
 ...
 check_consistency()
 ---
@@ -219,7 +222,7 @@ test_run:switch('box_3_a')
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 33
+- 67
 ...
 check_consistency()
 ---
@@ -246,7 +249,7 @@ test_run:switch('box_3_a')
 remove_replicaset_first_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_3_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_3_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -259,7 +262,7 @@ test_run:switch('box_3_b')
 remove_replicaset_first_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_3_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_3_b)
 ---
 ...
 fiber.sleep(0.5)
@@ -272,7 +275,7 @@ test_run:switch('box_2_a')
 remove_replicaset_first_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_2_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_2_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -285,7 +288,7 @@ test_run:switch('box_2_b')
 remove_replicaset_first_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_2_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_2_b)
 ---
 ...
 fiber.sleep(0.5)
@@ -298,7 +301,7 @@ test_run:switch('box_1_a')
 remove_replicaset_first_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -311,7 +314,7 @@ test_run:switch('box_1_b')
 remove_replicaset_first_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_b)
 ---
 ...
 fiber.sleep(0.5)
@@ -354,7 +357,7 @@ test_run:switch('box_1_a')
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 50
+- 100
 ...
 check_consistency()
 ---
@@ -366,7 +369,7 @@ test_run:switch('box_2_a')
 ...
 #box.space._bucket.index.status:select{vshard.consts.BUCKET.ACTIVE}
 ---
-- 50
+- 100
 ...
 check_consistency()
 ---
@@ -400,7 +403,7 @@ test_run:switch('box_2_a')
 remove_replicaset_second_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_2_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_2_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -413,7 +416,7 @@ test_run:switch('box_2_b')
 remove_replicaset_second_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_2_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_2_b)
 ---
 ...
 fiber.sleep(0.5)
@@ -426,7 +429,7 @@ test_run:switch('box_1_a')
 remove_replicaset_second_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_a)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_a)
 ---
 ...
 fiber.sleep(0.5)
@@ -439,7 +442,7 @@ test_run:switch('box_1_b')
 remove_replicaset_second_stage()
 ---
 ...
-vshard.storage.cfg(cfg, names.replica_uuid.box_1_b)
+vshard.storage.cfg(cfg, util.name_to_uuid.box_1_b)
 ---
 ...
 fiber.sleep(0.5)

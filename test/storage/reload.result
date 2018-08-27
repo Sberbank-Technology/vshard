@@ -22,19 +22,17 @@ util.wait_master(test_run, REPLICASET_1, 'storage_1_a')
 util.wait_master(test_run, REPLICASET_2, 'storage_2_a')
 ---
 ...
-test_run:switch('storage_1_a')
+util.map_evals(test_run, {REPLICASET_1, REPLICASET_2}, 'bootstrap_storage(\'memtx\')')
 ---
-- true
+...
+_ = test_run:switch('storage_1_a')
+---
 ...
 vshard.storage.bucket_force_create(1, vshard.consts.DEFAULT_BUCKET_COUNT / 2)
 ---
 - true
 ...
-test_run:switch('storage_2_a')
----
-- true
-...
-fiber = require('fiber')
+_ = test_run:switch('storage_2_a')
 ---
 ...
 vshard.storage.bucket_force_create(vshard.consts.DEFAULT_BUCKET_COUNT / 2 + 1, vshard.consts.DEFAULT_BUCKET_COUNT / 2)
@@ -56,9 +54,8 @@ vshard.storage.module_version()
 while test_run:grep_log('storage_2_a', 'The cluster is balanced ok') == nil do vshard.storage.rebalancer_wakeup() fiber.sleep(0.1) end
 ---
 ...
-test_run:cmd("setopt delimiter ';'")
+_ = test_run:cmd("setopt delimiter ';'")
 ---
-- true
 ...
 function check_reloaded()
 	for k, v in pairs(old_internal) do
@@ -89,9 +86,8 @@ function copy_functions(t)
 end;
 ---
 ...
-test_run:cmd("setopt delimiter ''");
+_ = test_run:cmd("setopt delimiter ''");
 ---
-- true
 ...
 --
 -- Simple reload. All functions are reloaded and they have
@@ -113,13 +109,13 @@ vshard.storage.module_version()
 check_reloaded()
 ---
 ...
-while test_run:grep_log('storage_2_a', 'Garbage collector has been reloaded') == nil do fiber.sleep(0.1) end
+while test_run:grep_log('storage_2_a', 'gc_bucket_f has been started') == nil do fiber.sleep(0.1) end
 ---
 ...
-while test_run:grep_log('storage_2_a', 'Recovery has been reloaded') == nil do fiber.sleep(0.1) vshard.storage.recovery_wakeup() end
+while test_run:grep_log('storage_2_a', 'recovery_f has been started') == nil do fiber.sleep(0.1) vshard.storage.recovery_wakeup() end
 ---
 ...
-while test_run:grep_log('storage_2_a', 'Rebalancer has been reloaded') == nil do fiber.sleep(0.1) vshard.storage.rebalancer_wakeup() end
+while test_run:grep_log('storage_2_a', 'rebalancer_f has been started') == nil do fiber.sleep(0.1) vshard.storage.rebalancer_wakeup() end
 ---
 ...
 check_reloaded()
@@ -174,9 +170,37 @@ vshard.storage.module_version()
 check_reloaded()
 ---
 ...
-test_run:switch('default')
+--
+-- Outdate old replicaset and replica objects.
+--
+_, rs = next(vshard.storage.internal.replicasets)
 ---
-- true
+...
+package.loaded["vshard.storage"] = nil
+---
+...
+_ = require('vshard.storage')
+---
+...
+rs.callro(rs, 'echo', {'some_data'})
+---
+- null
+- type: ShardingError
+  name: OBJECT_IS_OUTDATED
+  message: Object is outdated after module reload/reconfigure. Use new instance.
+  code: 20
+...
+_, rs = next(vshard.storage.internal.replicasets)
+---
+...
+rs.callro(rs, 'echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+_ = test_run:switch('default')
+---
 ...
 test_run:drop_cluster(REPLICASET_2)
 ---
@@ -184,7 +208,6 @@ test_run:drop_cluster(REPLICASET_2)
 test_run:drop_cluster(REPLICASET_1)
 ---
 ...
-test_run:cmd('clear filter')
+_ = test_run:cmd('clear filter')
 ---
-- true
 ...

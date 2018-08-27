@@ -4,6 +4,7 @@ REPLICASET_1 = { 'fullbox_1_a', 'fullbox_1_b' }
 REPLICASET_2 = { 'fullbox_2_a', 'fullbox_2_b' }
 REPLICASET_3 = { 'fullbox_3_a', 'fullbox_3_b' }
 REPLICASET_4 = { 'fullbox_4_a', 'fullbox_4_b' }
+engine = test_run:get_cfg('engine')
 
 test_run:create_cluster(REPLICASET_1, 'rebalancer')
 test_run:create_cluster(REPLICASET_2, 'rebalancer')
@@ -14,6 +15,8 @@ util.wait_master(test_run, REPLICASET_1, 'fullbox_1_a')
 util.wait_master(test_run, REPLICASET_2, 'fullbox_2_a')
 util.wait_master(test_run, REPLICASET_3, 'fullbox_3_a')
 util.wait_master(test_run, REPLICASET_4, 'fullbox_4_a')
+util.map_evals(test_run, {REPLICASET_1, REPLICASET_2, REPLICASET_3, REPLICASET_4}, 'bootstrap_storage(\'%s\')', engine)
+util.push_rs_filters(test_run)
 
 test_run:cmd('create server router_1 with script="rebalancer/router_1.lua"')
 test_run:cmd('start server router_1')
@@ -34,20 +37,17 @@ vshard.router.cfg(cfg)
 
 test_run:switch('fullbox_1_a')
 vshard.storage.rebalancer_disable()
-log = require('log')
 log.info(string.rep('a', 1000))
-for i = 1, vshard.consts.DEFAULT_BUCKET_COUNT do box.space._bucket:replace({i, vshard.consts.BUCKET.ACTIVE}) end
+for i = 1, 200 do box.space._bucket:replace({i, vshard.consts.BUCKET.ACTIVE}) end
 
 test_run:switch('router_1')
-util = require('rebalancer_utils')
-util.set_bucket_count(vshard.consts.DEFAULT_BUCKET_COUNT)
 for i = 1, 4 do vshard.router.discovery_wakeup() end
+util = require('rebalancer_utils')
 util.start_loading()
 fiber.sleep(2)
 
 test_run:switch('default')
 fiber = require('fiber')
-log = require('log')
 stop_killing = false
 is_rebalancer_down = false
 is_rebalancer_locked = false
@@ -105,7 +105,7 @@ while killer:status() ~= 'dead' do fiber.sleep(0.1) end
 test_run:switch('router_1')
 -- Wait until all GC, recovery-discovery finish work.
 start = fiber.time()
-while vshard.router.info().bucket.available_rw ~= vshard.consts.DEFAULT_BUCKET_COUNT do vshard.router.discovery_wakeup() fiber.sleep(0.1) end
+while vshard.router.info().bucket.available_rw ~= 200 do vshard.router.discovery_wakeup() fiber.sleep(0.1) end
 fiber.sleep(10 - (fiber.time() - start))
 info = vshard.router.info()
 -- Do not show concrete timeouts. They are not stable.
@@ -120,19 +120,15 @@ util.check_loading_result()
 
 test_run:switch('fullbox_1_a')
 vshard.storage.info().bucket
-vshard.storage.internal.buckets_to_recovery
 check_consistency()
 test_run:switch('fullbox_2_a')
 vshard.storage.info().bucket
-vshard.storage.internal.buckets_to_recovery
 check_consistency()
 test_run:switch('fullbox_3_a')
 vshard.storage.info().bucket
-vshard.storage.internal.buckets_to_recovery
 check_consistency()
 test_run:switch('fullbox_4_a')
 vshard.storage.info().bucket
-vshard.storage.internal.buckets_to_recovery
 check_consistency()
 
 test_run:switch('default')

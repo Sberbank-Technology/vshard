@@ -29,7 +29,6 @@ check(cfg)
 replica.uri = 'uri:uri@uri'
 
 -- Name is not string.
-check(cfg)
 replica.name = 100
 check(cfg)
 replica.name = 'storage'
@@ -58,11 +57,36 @@ check(cfg)
 cfg.sharding['rsid2'] = nil
 
 -- UUID duplicate in different replicasets.
-replicaset2 = {replicas = {['id3'] = {uri = 'uri:uri@uri2', name = 'storage', master = true}}}
+replicaset2 = {replicas = {['id3'] = {uri = 'uri:uri@uri2', name = 'storage2', master = true}}}
 cfg.sharding['rsid2'] = replicaset2
-replicaset3 = {replicas = {['id3'] = {uri = 'uri:uri@uri3', name = 'storage', master = true}}}
+replicaset3 = {replicas = {['id3'] = {uri = 'uri:uri@uri3', name = 'storage3', master = false}}}
 cfg.sharding['rsid3'] = replicaset3
 check(cfg)
+cfg.sharding['rsid3'] = nil
+cfg.sharding['rsid2'] = nil
+
+--
+-- gh-101: Log warning in case replica.name duplicate found.
+--
+
+-- name duplicate in one replicaset.
+replica2_1 = {uri = 'uri:uri@uri2_1', name = 'dup_name1', master = true}
+replica2_2 = {uri = 'uri:uri@uri2_2', name = 'dup_name1', master = false}
+replicaset2 = {replicas = {['id2'] = replica2_1, ['id3'] = replica2_2}}
+cfg.sharding['rsid2'] = replicaset2
+_ = check(cfg)
+test_run:grep_log('default', 'Duplicate replica.name is found: dup_name1')
+cfg.sharding['rsid2'] = nil
+
+-- name duplicate in different replicasets.
+replica2 = {uri = 'uri:uri@uri2', name = 'dup_name2', master = true}
+replica3 = {uri = 'uri:uri@uri3', name = 'dup_name2', master = true}
+replicaset2 = {replicas = {['id2'] = replica2}}
+replicaset3 = {replicas = {['id3'] = replica3}}
+cfg.sharding['rsid2'] = replicaset2
+cfg.sharding['rsid3'] = replicaset3
+_ = check(cfg)
+test_run:grep_log('default', 'Duplicate replica.name is found: dup_name2')
 cfg.sharding['rsid2'] = nil
 cfg.sharding['rsid3'] = nil
 
@@ -177,3 +201,25 @@ cfg.sync_timeout = 0
 _ = lcfg.check(cfg)
 cfg.sync_timeout = 10.5
 _ = lcfg.check(cfg)
+
+-- gh-91: Name is optional.
+replica.name = nil
+_ = lcfg.check(cfg)
+replica.name = 'storage'
+
+-- gh-47: Check uri
+old_uri = replica.url
+replica.uri = 'invalid uri'
+util.check_error(lcfg.check, cfg)
+
+replica.uri = '127.0.0.1'
+lcfg.check(cfg)['sharding']
+replica.uri = 'user:password@localhost'
+lcfg.check(cfg)['sharding']
+replica.url = old_uri
+
+-- gh-114: Check non-dynamic option change during reconfigure.
+cfg_with_non_default = table.copy(cfg)
+cfg.shard_index = nil
+cfg_with_non_default.shard_index = 'non_default_name'
+util.check_error(lcfg.check, cfg, cfg_with_non_default)

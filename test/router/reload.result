@@ -22,17 +22,17 @@ util.wait_master(test_run, REPLICASET_1, 'storage_1_a')
 util.wait_master(test_run, REPLICASET_2, 'storage_2_a')
 ---
 ...
-test_run:cmd("create server router_1 with script='router/router_1.lua'")
+util.map_evals(test_run, {REPLICASET_1, REPLICASET_2}, 'bootstrap_storage(\'memtx\')')
 ---
-- true
 ...
-test_run:cmd("start server router_1")
+_ = test_run:cmd("create server router_1 with script='router/router_1.lua'")
 ---
-- true
 ...
-test_run:switch('router_1')
+_ = test_run:cmd("start server router_1")
 ---
-- true
+...
+_ = test_run:switch('router_1')
+---
 ...
 fiber = require('fiber')
 ---
@@ -59,9 +59,8 @@ vshard.router.module_version()
 ---
 - 0
 ...
-test_run:cmd("setopt delimiter ';'")
+_ = test_run:cmd("setopt delimiter ';'")
 ---
-- true
 ...
 function check_reloaded()
 	for k, v in pairs(old_internal) do
@@ -92,9 +91,8 @@ function copy_functions(t)
 end;
 ---
 ...
-test_run:cmd("setopt delimiter ''");
+_ = test_run:cmd("setopt delimiter ''");
 ---
-- true
 ...
 --
 -- Simple reload. All functions are reloaded and they have
@@ -116,10 +114,10 @@ vshard.router.module_version()
 check_reloaded()
 ---
 ...
-while test_run:grep_log('router_1', 'Failover has been reloaded') == nil do fiber.sleep(0.1) end
+while test_run:grep_log('router_1', 'failover_f has been started') == nil do fiber.sleep(0.1) end
 ---
 ...
-while test_run:grep_log('router_1', 'Discovery has been reloaded') == nil do fiber.sleep(0.1) vshard.router.discovery_wakeup() end
+while test_run:grep_log('router_1', 'discovery_f has been started') == nil do fiber.sleep(0.1) vshard.router.discovery_wakeup() end
 ---
 ...
 check_reloaded()
@@ -174,25 +172,144 @@ vshard.router.module_version()
 check_reloaded()
 ---
 ...
-test_run:switch('default')
+--
+-- Outdate old replicaset and replica objects.
+--
+rs = vshard.router.route(1)
+---
+...
+rs:callro('echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+package.loaded["vshard.router"] = nil
+---
+...
+_ = require('vshard.router')
+---
+...
+-- Make sure outdate async task has had cpu time.
+while not rs.is_outdated do fiber.sleep(0.001) end
+---
+...
+rs.callro(rs, 'echo', {'some_data'})
+---
+- null
+- type: ShardingError
+  name: OBJECT_IS_OUTDATED
+  message: Object is outdated after module reload/reconfigure. Use new instance.
+  code: 20
+...
+vshard.router = require('vshard.router')
+---
+...
+rs = vshard.router.route(1)
+---
+...
+rs:callro('echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+-- Test `connection_outdate_delay`.
+old_connection_delay = cfg.connection_outdate_delay
+---
+...
+cfg.connection_outdate_delay = 0.3
+---
+...
+vshard.router.cfg(cfg)
+---
+...
+cfg.connection_outdate_delay = old_connection_delay
+---
+...
+vshard.router.static.connection_outdate_delay = nil
+---
+...
+rs_new = vshard.router.route(1)
+---
+...
+rs_old = rs
+---
+...
+_, replica_old = next(rs_old.replicas)
+---
+...
+rs_new:callro('echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+-- Check old objets are still valid.
+rs_old:callro('echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+replica_old.conn ~= nil
 ---
 - true
 ...
-test_run:cmd('stop server router_1')
+fiber.sleep(0.2)
+---
+...
+rs_old:callro('echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+replica_old.conn ~= nil
 ---
 - true
 ...
-test_run:cmd('cleanup server router_1')
+replica_old.is_outdated == nil
 ---
 - true
+...
+fiber.sleep(0.2)
+---
+...
+rs_old:callro('echo', {'some_data'})
+---
+- null
+- type: ShardingError
+  name: OBJECT_IS_OUTDATED
+  message: Object is outdated after module reload/reconfigure. Use new instance.
+  code: 20
+...
+replica_old.conn == nil
+---
+- true
+...
+replica_old.is_outdated == true
+---
+- true
+...
+rs_new:callro('echo', {'some_data'})
+---
+- some_data
+- null
+- null
+...
+_ = test_run:switch('default')
+---
+...
+_ = test_run:cmd('stop server router_1')
+---
+...
+_ = test_run:cmd('cleanup server router_1')
+---
 ...
 test_run:drop_cluster(REPLICASET_2)
 ---
 ...
 test_run:drop_cluster(REPLICASET_1)
 ---
-...
-test_run:cmd('clear filter')
----
-- true
 ...

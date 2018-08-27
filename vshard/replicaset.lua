@@ -21,6 +21,7 @@
 --                                  requests to the replica>,
 --             net_sequential_fail = <count of sequential failed
 --                                    requests to the replica>,
+--             is_outdated = nil/true,
 --          }
 --      },
 --      master = <master server from the array above>,
@@ -31,9 +32,10 @@
 --      uuid = <replicaset_uuid>,
 --      weight = number,
 --      priority_list = <list of replicas, sorted by weight asc>,
---      ethalon_bucket_count = <bucket count, that must be stored
---                              on this replicaset to reach the
---                              balance in a cluster>,
+--      etalon_bucket_count = <bucket count, that must be stored
+--                             on this replicaset to reach the
+--                             balance in a cluster>,
+--      is_outdated = nil/true,
 --  }
 --
 -- replicasets = {
@@ -48,6 +50,8 @@ local lerror = require('vshard.error')
 local fiber = require('fiber')
 local luri = require('uri')
 local ffi = require('ffi')
+local util = require('vshard.util')
+local gsc = util.generate_self_checker
 
 --
 -- on_connect() trigger for net.box
@@ -113,8 +117,8 @@ end
 local function replicaset_connect_master(replicaset)
     local master = replicaset.master
     if master == nil then
-        return nil, lerror.vshard(lerror.code.MASTER_IS_MISSING,
-                                  {replicaset_uuid = replicaset.uuid})
+        return nil, lerror.vshard(lerror.code.MISSING_MASTER,
+                                  replicaset.uuid)
     end
     return replicaset_connect_to_replica(replicaset, master)
 end
@@ -258,7 +262,10 @@ local function replicaset_master_call(replicaset, func, args, opts)
     assert(opts == nil or type(opts) == 'table')
     assert(type(func) == 'string', 'function name')
     assert(args == nil or type(args) == 'table', 'function arguments')
-    replicaset_connect_master(replicaset)
+    local conn, err = replicaset_connect_master(replicaset)
+    if not conn then
+        return nil, err
+    end
     local timeout = opts and opts.timeout or replicaset.master.net_timeout
     local net_status, storage_status, retval, error_object =
         replica_call(replicaset.master, func, args, timeout)
@@ -301,7 +308,10 @@ local function replicaset_nearest_call(replicaset, func, args, opts)
         if replica and replica:is_connected() then
             conn = replica.conn
         else
-            conn = replicaset_connect_master(replicaset)
+            conn, error_object = replicaset_connect_master(replicaset)
+            if not conn then
+                return nil, error_object
+            end
             replica = replicaset.master
         end
         net_status, storage_status, retval, error_object =
@@ -337,24 +347,30 @@ local function replicaset_tostring(replicaset)
 end
 
 --
--- Rebind connections of old replicas to new ones.
+-- Copy netbox connections from old replica objects to new ones
+-- and outdate old objects.
+-- @param replicasets New replicasets
+-- @param old_replicasets Replicasets and replicas to be outdated.
 --
-local function replicaset_rebind_connections(replicaset)
-    for _, replica in pairs(replicaset.replicas) do
-        local old_replica = replica.old_replica
-        if old_replica then
-            local conn = old_replica.conn
-            replica.conn = conn
-            replica.down_ts = old_replica.down_ts
-            replica.net_timeout = old_replica.net_timeout
-            replica.net_sequential_ok = old_replica.net_sequential_ok
-            replica.net_sequential_fail = old_replica.net_sequential_fail
-            if conn then
-                conn.replica = replica
-                conn.replicaset = replicaset
-                old_replica.conn = nil
+local function rebind_replicasets(replicasets, old_replicasets)
+    for replicaset_uuid, replicaset in pairs(replicasets) do
+        local old_replicaset = old_replicasets and
+                               old_replicasets[replicaset_uuid]
+        for replica_uuid, replica in pairs(replicaset.replicas) do
+            local old_replica = old_replicaset and
+                                old_replicaset.replicas[replica_uuid]
+            if old_replica then
+                local conn = old_replica.conn
+                replica.conn = conn
+                replica.down_ts = old_replica.down_ts
+                replica.net_timeout = old_replica.net_timeout
+                replica.net_sequential_ok = old_replica.net_sequential_ok
+                replica.net_sequential_fail = old_replica.net_sequential_fail
+                if conn then
+                    conn.replica = replica
+                    conn.replicaset = replicaset
+                end
             end
-            replica.old_replica = nil
         end
     end
 end
@@ -368,7 +384,6 @@ local replicaset_mt = {
         connect_master = replicaset_connect_master;
         connect_all = replicaset_connect_all;
         connect_replica = replicaset_connect_to_replica;
-        rebind_connections = replicaset_rebind_connections;
         down_replica_priority = replicaset_down_replica_priority;
         up_replica_priority = replicaset_up_replica_priority;
         call = replicaset_master_call;
@@ -377,6 +392,14 @@ local replicaset_mt = {
     };
     __tostring = replicaset_tostring;
 }
+--
+-- Wrap self methods with a sanity checker.
+--
+local index = {}
+for name, func in pairs(replicaset_mt.__index) do
+    index[name] = gsc("replicaset", name, replicaset_mt, func)
+end
+replicaset_mt.__index = index
 
 local replica_mt = {
     __index = {
@@ -390,12 +413,73 @@ local replica_mt = {
         end,
     },
     __tostring = function(replica)
-        return replica.name..'('..replica:safe_uri()..')'
+        if replica.name then
+            return replica.name..'('..replica:safe_uri()..')'
+        else
+            return replica:safe_uri()
+        end
     end,
 }
+index = {}
+for name, func in pairs(replica_mt.__index) do
+    index[name] = gsc("replica", name, replica_mt, func)
+end
+replica_mt.__index = index
 
 --
--- Calculate for each replicaset its ethalon bucket count.
+-- Meta-methods of outdated objects.
+-- They define only attributes from corresponding metatables to
+-- make user able to access fields of old objects.
+--
+local function outdated_warning(...)
+    return nil, lerror.vshard(lerror.code.OBJECT_IS_OUTDATED)
+end
+
+local outdated_replicaset_mt = {
+    __index = {
+        is_outdated = true
+    }
+}
+for fname, func in pairs(replicaset_mt.__index) do
+    outdated_replicaset_mt.__index[fname] = outdated_warning
+end
+
+local outdated_replica_mt = {
+    __index = {
+        is_outdated = true
+    }
+}
+for fname, func in pairs(replica_mt.__index) do
+    outdated_replica_mt.__index[fname] = outdated_warning
+end
+
+local function outdate_replicasets_f(replicasets)
+    for _, replicaset in pairs(replicasets) do
+        setmetatable(replicaset, outdated_replicaset_mt)
+        for _, replica in pairs(replicaset.replicas) do
+            setmetatable(replica, outdated_replica_mt)
+            replica.conn = nil
+        end
+    end
+    log.info('Old replicaset and replica objects are outdated.')
+end
+
+--
+-- Outdate replicaset and replica objects:
+--  * Set outdated_metatables.
+--  * Remove connections.
+-- @param replicasets Old replicasets to be outdated.
+-- @param outdate_delay Delay in seconds before the outdating.
+--
+local function outdate_replicasets(replicasets, outdate_delay)
+    if replicasets then
+        util.async_task(outdate_delay, outdate_replicasets_f,
+                        replicasets)
+    end
+end
+
+--
+-- Calculate for each replicaset its etalon bucket count.
 -- Iterative algorithm is used to learn the best balance in a
 -- cluster. On each step it calculates perfect bucket count for
 -- each replicaset. If this count can not be satisfied due to
@@ -412,7 +496,7 @@ local replica_mt = {
 -- least one new overpopulated replicaset, so it has complexity
 -- O(N^2), where N - replicaset count.
 --
-local function cluster_calculate_ethalon_balance(replicasets, bucket_count)
+local function cluster_calculate_etalon_balance(replicasets, bucket_count)
     local is_balance_found = false
     local weight_sum = 0
     local step_count = 0
@@ -428,10 +512,10 @@ local function cluster_calculate_ethalon_balance(replicasets, bucket_count)
         local buckets_calculated = 0
         for _, replicaset in pairs(replicasets) do
             if not replicaset.ignore_disbalance then
-                replicaset.ethalon_bucket_count =
+                replicaset.etalon_bucket_count =
                     math.ceil(replicaset.weight * bucket_per_weight)
                 buckets_calculated =
-                    buckets_calculated + replicaset.ethalon_bucket_count
+                    buckets_calculated + replicaset.etalon_bucket_count
             end
         end
         local buckets_rest = buckets_calculated - bucket_count
@@ -445,9 +529,9 @@ local function cluster_calculate_ethalon_balance(replicasets, bucket_count)
                     local n = replicaset.weight * bucket_per_weight
                     local ceil = math.ceil(n)
                     local floor = math.floor(n)
-                    if replicaset.ethalon_bucket_count > 0 and ceil ~= floor then
-                        replicaset.ethalon_bucket_count =
-                            replicaset.ethalon_bucket_count - 1
+                    if replicaset.etalon_bucket_count > 0 and ceil ~= floor then
+                        replicaset.etalon_bucket_count =
+                            replicaset.etalon_bucket_count - 1
                         buckets_rest = buckets_rest - 1
                     end
                 end
@@ -456,7 +540,7 @@ local function cluster_calculate_ethalon_balance(replicasets, bucket_count)
                 -- pinned buckets.
                 --
                 local pinned = replicaset.pinned_count
-                if pinned and replicaset.ethalon_bucket_count < pinned then
+                if pinned and replicaset.etalon_bucket_count < pinned then
                     -- This replicaset can not send out enough
                     -- buckets to reach a balance. So do the best
                     -- effort balance by sending from the
@@ -466,7 +550,7 @@ local function cluster_calculate_ethalon_balance(replicasets, bucket_count)
                     -- calculation.
                     is_balance_found = false
                     bucket_count = bucket_count - replicaset.pinned_count
-                    replicaset.ethalon_bucket_count = replicaset.pinned_count
+                    replicaset.etalon_bucket_count = replicaset.pinned_count
                     replicaset.ignore_disbalance = true
                     weight_sum = weight_sum - replicaset.weight
                 end
@@ -485,7 +569,7 @@ end
 --
 -- Update/build replicasets from configuration
 --
-local function buildall(sharding_cfg, old_replicasets)
+local function buildall(sharding_cfg)
     local new_replicasets = {}
     local weights = sharding_cfg.weights
     local zone = sharding_cfg.zone
@@ -497,8 +581,6 @@ local function buildall(sharding_cfg, old_replicasets)
     end
     local curr_ts = fiber.time()
     for replicaset_uuid, replicaset in pairs(sharding_cfg.sharding) do
-        local old_replicaset = old_replicasets and
-                               old_replicasets[replicaset_uuid]
         local new_replicaset = setmetatable({
             replicas = {},
             uuid = replicaset_uuid,
@@ -508,8 +590,6 @@ local function buildall(sharding_cfg, old_replicasets)
         }, replicaset_mt)
         local priority_list = {}
         for replica_uuid, replica in pairs(replicaset.replicas) do
-            local old_replica = old_replicaset and
-                                old_replicaset.replicas[replica_uuid]
             -- The old replica is saved in the new object to
             -- rebind its connection at the end of a
             -- router/storage reconfiguration.
@@ -517,7 +597,7 @@ local function buildall(sharding_cfg, old_replicasets)
                 uri = replica.uri, name = replica.name, uuid = replica_uuid,
                 zone = replica.zone, net_timeout = consts.CALL_TIMEOUT_MIN,
                 net_sequential_ok = 0, net_sequential_fail = 0,
-                down_ts = curr_ts, old_replica = old_replica,
+                down_ts = curr_ts,
             }, replica_mt)
             new_replicaset.replicas[replica_uuid] = new_replica
             if replica.master then
@@ -574,23 +654,10 @@ local function wait_masters_connect(replicasets)
     end
 end
 
---
--- Close all connections of all replicas.
---
-local function destroy(replicasets)
-    for _, rs in pairs(replicasets) do
-        if rs.master and rs.master.conn then
-            rs.master.conn:close()
-        end
-        if rs.replica and rs.replica.conn then
-            rs.replica.conn:close()
-        end
-    end
-end
-
 return {
     buildall = buildall,
-    calculate_ethalon_balance = cluster_calculate_ethalon_balance,
-    destroy = destroy,
+    calculate_etalon_balance = cluster_calculate_etalon_balance,
     wait_masters_connect = wait_masters_connect,
+    rebind_replicasets = rebind_replicasets,
+    outdate_replicasets = outdate_replicasets,
 }

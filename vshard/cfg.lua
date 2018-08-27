@@ -5,9 +5,8 @@ local luri = require('uri')
 local consts = require('vshard.consts')
 
 local function check_uri(uri)
-    uri = luri.parse(uri)
-    if uri.login == nil or uri.password == nil then
-        error('URI must contain login and password')
+    if not luri.parse(uri) then
+        error('Invalid URI: ' .. uri)
     end
 end
 
@@ -44,9 +43,7 @@ local type_validate = {
 }
 
 local function validate_config(config, template, check_arg)
-    for _, key_template in pairs(template) do
-        local key = key_template[1]
-        local template_value = key_template[2]
+    for key, template_value in pairs(template) do
         local value = config[key]
         if not value then
             if not template_value.is_optional then
@@ -84,13 +81,13 @@ local function validate_config(config, template, check_arg)
 end
 
 local replica_template = {
-    {'uri', {type = 'non-empty string', name = 'URI', check = check_uri}},
-    {'name', {type = 'string', name = "Name"}},
-    {'zone', {type = {'string', 'number'}, name = "Zone", is_optional = true}},
-    {'master', {
+    uri = {type = 'non-empty string', name = 'URI', check = check_uri},
+    name = {type = 'string', name = "Name", is_optional = true},
+    zone = {type = {'string', 'number'}, name = "Zone", is_optional = true},
+    master = {
         type = 'boolean', name = "Master", is_optional = true, default = false,
         check = check_master
-    }},
+    },
 }
 
 local function check_replicas(replicas)
@@ -101,12 +98,12 @@ local function check_replicas(replicas)
 end
 
 local replicaset_template = {
-    {'replicas', {type = 'table', name = 'Replicas', check = check_replicas}},
-    {'weight', {
+    replicas = {type = 'table', name = 'Replicas', check = check_replicas},
+    weight = {
         type = 'non-negative number', name = 'Weight', is_optional = true,
         default = 1,
-    }},
-    {'lock', {type = 'boolean', name = 'Lock', is_optional = true}},
+    },
+    lock = {type = 'boolean', name = 'Lock', is_optional = true},
 }
 
 --
@@ -141,6 +138,7 @@ end
 local function check_sharding(sharding)
     local uuids = {}
     local uris = {}
+    local names = {}
     for replicaset_uuid, replicaset in pairs(sharding) do
         if uuids[replicaset_uuid] then
             error(string.format('Duplicate uuid %s', replicaset_uuid))
@@ -159,83 +157,118 @@ local function check_sharding(sharding)
                 error(string.format('Duplicate uuid %s', replica_uuid))
             end
             uuids[replica_uuid] = true
+            -- Log warning in case replica.name duplicate is
+            -- found. Message appears once for each unique
+            -- duplicate.
+            local name = replica.name
+            if name then
+                if names[name] == nil then
+                    names[name] = 1
+                elseif names[name] == 1 then
+                    log.warn('Duplicate replica.name is found: %s', name)
+                    -- Next duplicates should not be reported.
+                    names[name] = 2
+                end
+            end
         end
     end
 end
 
 local cfg_template = {
-    {'sharding', {type = 'table', name = 'Sharding', check = check_sharding}},
-    {'weights', {
+    sharding = {type = 'table', name = 'Sharding', check = check_sharding},
+    weights = {
         type = 'table', name = 'Weight matrix', is_optional = true,
         check = cfg_check_weights
-    }},
-    {'shard_index', {
+    },
+    shard_index = {
         type = {'non-empty string', 'non-negative integer'},
         name = 'Shard index', is_optional = true, default = 'bucket_id',
-    }},
-    {'zone', {
+    },
+    zone = {
         type = {'string', 'number'}, name = 'Zone identifier',
         is_optional = true
-    }},
-    {'bucket_count', {
+    },
+    bucket_count = {
         type = 'positive integer', name = 'Bucket count', is_optional = true,
         default = consts.DEFAULT_BUCKET_COUNT
-    }},
-    {'rebalancer_disbalance_threshold', {
+    },
+    rebalancer_disbalance_threshold = {
         type = 'non-negative number', name = 'Rebalancer disbalance threshold',
         is_optional = true,
         default = consts.DEFAULT_REBALANCER_DISBALANCE_THRESHOLD
-    }},
-    {'rebalancer_max_receiving', {
+    },
+    rebalancer_max_receiving = {
         type = 'positive integer',
         name = 'Rebalancer max receiving bucket count', is_optional = true,
         default = consts.DEFAULT_REBALANCER_MAX_RECEIVING
-    }},
-    {'collect_bucket_garbage_interval', {
+    },
+    collect_bucket_garbage_interval = {
         type = 'positive number', name = 'Garbage bucket collect interval',
         is_optional = true,
         default = consts.DEFAULT_COLLECT_BUCKET_GARBAGE_INTERVAL
-    }},
-    {'collect_lua_garbage', {
+    },
+    collect_lua_garbage = {
         type = 'boolean', name = 'Garbage Lua collect necessity',
         is_optional = true, default = false
-    }},
-    {'sync_timeout', {
+    },
+    sync_timeout = {
         type = 'non-negative number', name = 'Sync timeout', is_optional = true,
         default = consts.DEFAULT_SYNC_TIMEOUT
-    }},
+    },
+    connection_outdate_delay = {
+        type = 'non-negative number', name = 'Object outdate timeout',
+        is_optional = true
+    },
+}
+
+--
+-- Split it into vshard_cfg and box_cfg parts.
+--
+local function cfg_split(cfg)
+    local vshard_cfg = {}
+    local box_cfg = {}
+    for k, v in pairs(cfg) do
+        if cfg_template[k] then
+            vshard_cfg[k] = v
+        else
+            box_cfg[k] = v
+        end
+    end
+    return vshard_cfg, box_cfg
+end
+
+--
+-- Names of options which cannot be changed during reconfigure.
+--
+local non_dynamic_options = {
+    'bucket_count', 'shard_index'
 }
 
 --
 -- Check sharding config on correctness. Check types, name and uri
--- uniqueness, master count (in each replicaset must by <= 1).
+-- uniqueness, master count (in each replicaset must be <= 1).
 --
-local function cfg_check(shard_cfg)
+local function cfg_check(shard_cfg, old_cfg)
     if type(shard_cfg) ~= 'table' then
         error('Сonfig must be map of options')
     end
     shard_cfg = table.deepcopy(shard_cfg)
     validate_config(shard_cfg, cfg_template)
+    if not old_cfg then
+        return shard_cfg
+    end
+    -- Check non-dynamic after default values are added.
+    for _, f_name in pairs(non_dynamic_options) do
+        -- New option may be added in new vshard version.
+        if shard_cfg[f_name] ~= old_cfg[f_name] then
+           error(string.format('Non-dynamic option %s ' ..
+                               'cannot be reconfigured', f_name))
+        end
+    end
     return shard_cfg
-end
-
---
--- Nullify non-box options.
---
-local function remove_non_box_options(cfg)
-    cfg.sharding = nil
-    cfg.weights = nil
-    cfg.zone = nil
-    cfg.bucket_count = nil
-    cfg.rebalancer_disbalance_threshold = nil
-    cfg.rebalancer_max_receiving = nil
-    cfg.shard_index = nil
-    cfg.collect_bucket_garbage_interval = nil
-    cfg.collect_lua_garbage = nil
-    cfg.sync_timeout = nil
 end
 
 return {
     check = cfg_check,
-    remove_non_box_options = remove_non_box_options,
+    split = cfg_split,
 }
