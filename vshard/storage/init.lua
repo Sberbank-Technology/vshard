@@ -1718,35 +1718,6 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         log.info('I am master')
     end
 
-<<<<<<< HEAD
-    -- Do not change 'read_only' option here - if a master is
-    -- disabled and there are triggers on master disable, then
-    -- they would not be able to modify anything, if 'read_only'
-    -- had been set here. 'Read_only' is set in
-    -- local_on_master_disable after triggers and is unset in
-    -- local_on_master_enable before triggers.
-    --
-    -- If a master role of the replica is not changed, then
-    -- 'read_only' can be set right here.
-	local uri = luri.parse(this_replica.uri)
-    cfg.listen = cfg.listen or tonumber(uri.service)
-    if cfg.replication == nil and this_replicaset.master and not is_master then
-        cfg.replication = {this_replicaset.master.uri}
-    else
-        cfg.replication = {}
-    end
-    if was_master == is_master then
-        cfg.read_only = not is_master
-    end
-    cfg.instance_uuid = this_replica.uuid
-    cfg.replicaset_uuid = this_replicaset.uuid
-    local total_bucket_count = cfg.bucket_count
-    local rebalancer_disbalance_threshold = cfg.rebalancer_disbalance_threshold
-    local rebalancer_max_receiving = cfg.rebalancer_max_receiving
-    local shard_index = cfg.shard_index
-    local collect_bucket_garbage_interval = cfg.collect_bucket_garbage_interval
-    local collect_lua_garbage = cfg.collect_lua_garbage
-=======
     -- It is considered that all possible errors during cfg
     -- process occur only before this place.
     -- This check should be placed as late as possible.
@@ -1754,7 +1725,6 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         error('Error injection: cfg')
     end
 
->>>>>>> dd91843a622329d991e1ce1cda207602d35dc477
     --
     -- Sync timeout is a special case - it must be updated before
     -- all other options to allow a user to demote a master with
@@ -1830,14 +1800,8 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         box.space._bucket:on_replace(bucket_generation_increment, old)
     end
 
-<<<<<<< HEAD
-    log.info("Box has been configured")
-    box.once("vshard:storage:1", storage_schema_v1, uri.login, uri.password)
-
-=======
     lreplicaset.rebind_replicasets(new_replicasets, M.replicasets)
     lreplicaset.outdate_replicasets(M.replicasets)
->>>>>>> dd91843a622329d991e1ce1cda207602d35dc477
     M.replicasets = new_replicasets
     M.this_replicaset = this_replicaset
     M.this_replica = this_replica
