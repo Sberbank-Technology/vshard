@@ -287,7 +287,29 @@ e.trace = nil
 ...
 e
 ---
-- {'type': 'ClientError', 'message': 'Unknown error', 'code': 32}
+- type: ClientError
+  message: Unknown error
+  code: 32
+...
+tostring(e)
+---
+- '{"type":"ClientError","message":"Unknown error","code":32}'
+...
+_, e = vshard.router.route(1):callro('raise_client_error', {})
+---
+...
+e.trace = nil
+---
+...
+e
+---
+- type: ClientError
+  code: 0
+  message: Unknown error
+...
+tostring(e)
+---
+- '{"type":"ClientError","code":0,"message":"Unknown error"}'
 ...
 --
 -- gh-48: more precise error messages about bucket unavailability.
@@ -346,9 +368,12 @@ vshard.router.call(1, 'read', 'echo', {123})
 util.check_error(vshard.router.call, 1, 'write', 'echo', {123})
 ---
 - null
-- {'bucket_id': 1, 'code': 7, 'type': 'ShardingError', 'destination': '<replicaset_1>',
-  'name': 'TRANSFER_IS_IN_PROGRESS', 'message': 'Bucket 1 is transferring to replicaset
-    <replicaset_1>'}
+- bucket_id: 1
+  code: 7
+  type: ShardingError
+  destination: <replicaset_1>
+  name: TRANSFER_IS_IN_PROGRESS
+  message: Bucket 1 is transferring to replicaset <replicaset_1>
 ...
 _ = test_run:switch('storage_2_a')
 ---
@@ -492,6 +517,10 @@ vshard.router.callrw(bucket_id, 'space_insert', {'test', {1, bucket_id}})
 ---
 - [1, 1]
 ...
+vshard.router.callrw(bucket_id, 'vshard.storage.sync', {})
+---
+- true
+...
 vshard.router.callro(bucket_id, 'space_get', {'test', {1}})
 ---
 - [1, 1]
@@ -499,6 +528,137 @@ vshard.router.callro(bucket_id, 'space_get', {'test', {1}})
 vshard.router.callro(bucket_id + 1500, 'space_get', {'test', {1}}) -- nothing
 ---
 - null
+...
+--
+-- gh-82: support box.session.push().
+--
+messages = {}
+---
+...
+args = {100, 200}
+---
+...
+opts = {on_push = table.insert, on_push_ctx = messages}
+---
+...
+vshard.router.callrw(bucket_id, 'do_push', args, opts)
+---
+- 200
+...
+messages
+---
+- - 100
+...
+messages[1] = nil
+---
+...
+vshard.router.callro(bucket_id, 'do_push', args, opts)
+---
+- 200
+...
+messages
+---
+- - 100
+...
+messages[1] = nil
+---
+...
+vshard.router.route(bucket_id):callro('do_push', args, opts)
+---
+- 200
+- null
+- null
+...
+messages
+---
+- - 100
+...
+messages[1] = nil
+---
+...
+vshard.router.route(bucket_id):callrw('do_push', args, opts)
+---
+- 200
+- null
+- null
+...
+messages
+---
+- - 100
+...
+--
+-- gh-171: support is_async.
+--
+future = vshard.router.callro(bucket_id, 'space_get', {'test', {1}}, {is_async = true})
+---
+...
+future:wait_result()
+---
+- [[1, 1]]
+...
+future:is_ready()
+---
+- true
+...
+future = vshard.router.callrw(bucket_id, 'raise_client_error', {}, {is_async = true})
+---
+...
+future:wait_result()
+---
+- null
+- {'type': 'ClientError', 'message': 'Unknown error', 'code': 32, 'trace': [{'file': '[C]',
+      'line': 4294967295}]}
+...
+future:is_ready()
+---
+- true
+...
+future = vshard.router.callrw(bucket_id, 'do_push', args, {is_async = true})
+---
+...
+func, iter, i = future:pairs()
+---
+...
+i, res = func(iter, i)
+---
+...
+res
+---
+- 100
+...
+i, res = func(iter, i)
+---
+...
+res
+---
+- [200]
+...
+func(iter, i)
+---
+- null
+- null
+...
+future:wait_result()
+---
+- [200]
+...
+future:is_ready()
+---
+- true
+...
+future = vshard.router.route(bucket_id):callro('space_get', {'test', {1}}, {is_async = true})
+---
+...
+future:wait_result()
+---
+- [[1, 1]]
+...
+future = vshard.router.route(bucket_id):callrw('space_get', {'test', {1}}, {is_async = true})
+---
+...
+future:wait_result()
+---
+- [[1, 1]]
 ...
 --
 -- Test errors from router call.
@@ -912,10 +1072,13 @@ _ = test_run:switch("router_1")
 util.check_error(vshard.router.call, 1, 'write', 'echo', { 'hello world' })
 ---
 - null
-- {'replica_uuid': '<storage_2_a>', 'replicaset_uuid': '<replicaset_2>',
-  'type': 'ShardingError', 'message': 'Replica <storage_2_a>
-    is not a master for replicaset <replicaset_2> anymore',
-  'name': 'NON_MASTER', 'code': 2}
+- replica_uuid: <storage_2_a>
+  replicaset_uuid: <replicaset_2>
+  type: ShardingError
+  message: Replica <storage_2_a> is not a master for replicaset
+    <replicaset_2> anymore
+  name: NON_MASTER
+  code: 2
 ...
 -- Reconfigure router and test that the WRITE request does work
 vshard.router.cfg(cfg)
@@ -964,13 +1127,16 @@ error_messages
 ---
 - - Use replicaset:callro(...) instead of replicaset.callro(...)
   - Use replicaset:connect_master(...) instead of replicaset.connect_master(...)
+  - Use replicaset:callre(...) instead of replicaset.callre(...)
   - Use replicaset:connect_replica(...) instead of replicaset.connect_replica(...)
   - Use replicaset:down_replica_priority(...) instead of replicaset.down_replica_priority(...)
+  - Use replicaset:callrw(...) instead of replicaset.callrw(...)
+  - Use replicaset:callbro(...) instead of replicaset.callbro(...)
+  - Use replicaset:connect_all(...) instead of replicaset.connect_all(...)
   - Use replicaset:call(...) instead of replicaset.call(...)
   - Use replicaset:connect(...) instead of replicaset.connect(...)
   - Use replicaset:up_replica_priority(...) instead of replicaset.up_replica_priority(...)
-  - Use replicaset:callrw(...) instead of replicaset.callrw(...)
-  - Use replicaset:connect_all(...) instead of replicaset.connect_all(...)
+  - Use replicaset:callbre(...) instead of replicaset.callbre(...)
 ...
 _, replica = next(replicaset.replicas)
 ---
@@ -992,8 +1158,9 @@ _ = test_run:cmd("setopt delimiter ''");
 ...
 error_messages
 ---
-- - Use replica:is_connected(...) instead of replica.is_connected(...)
-  - Use replica:safe_uri(...) instead of replica.safe_uri(...)
+- - Use replica:safe_uri(...) instead of replica.safe_uri(...)
+  - Use replica:detach_conn(...) instead of replica.detach_conn(...)
+  - Use replica:is_connected(...) instead of replica.is_connected(...)
 ...
 --
 -- gh-117: Preserve route_map on router.cfg.

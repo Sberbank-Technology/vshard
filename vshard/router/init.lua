@@ -21,6 +21,7 @@ local lhash = require('vshard.hash')
 local lreplicaset = require('vshard.replicaset')
 local util = require('vshard.util')
 local lua_gc = require('vshard.lua_gc')
+local seq_serializer = { __serialize = 'seq' }
 
 local M = rawget(_G, MODULE_INTERNALS)
 if not M then
@@ -67,6 +68,10 @@ local ROUTER_TEMPLATE = {
         total_bucket_count = 0,
         -- Boolean lua_gc state (create periodic gc task).
         collect_lua_garbage = nil,
+        -- Timeout after which a ping is considered to be
+        -- unacknowledged. Used by failover fiber to detect if a
+        -- node is down.
+        failover_ping_timeout = nil,
 }
 
 local STATIC_ROUTER_NAME = '_static_router'
@@ -239,16 +244,68 @@ end
 -- API
 --------------------------------------------------------------------------------
 
+--
+-- Since 1.10 netbox supports flag 'is_async'. Given this flag, a
+-- request result is returned immediately in a form of a future
+-- object. Future of CALL request returns a result wrapped into an
+-- array instead of unpacked values because unpacked values can
+-- not be stored anywhere.
+--
+-- Vshard.router.call calls a user function not directly, but via
+-- vshard.storage.call which returns true/false, result, errors.
+-- So vshard.router.call should wrap a future object with its own
+-- unpacker of result.
+--
+-- Unpack a result given from a future object from
+-- vshard.storage.call. If future returns [status, result, ...]
+-- this function returns [result]. Or a classical couple
+-- nil, error.
+--
+function future_storage_call_result(self)
+    local res, err = self:base_result()
+    if not res then
+        return nil, err
+    end
+    local storage_call_status, call_status, call_error = unpack(res)
+    if storage_call_status then
+        if call_status == nil and call_error ~= nil then
+            return call_status, call_error
+        else
+            return setmetatable({call_status}, seq_serializer)
+        end
+    end
+    return nil, call_status
+end
+
+--
+-- Given a netbox future object, redefine its 'result' method.
+-- It is impossible to just create a new signle metatable per
+-- the module as a copy of original future's one because it has
+-- some upvalues related to the netbox connection.
+--
+local function wrap_storage_call_future(future)
+    -- Base 'result' below is got from __index metatable under the
+    -- hood. But __index is used only when a table has no such a
+    -- member in itself. So via adding 'result' as a member to a
+    -- future object its __index.result can be redefined.
+    future.base_result = future.result
+    future.result = future_storage_call_result
+    return future
+end
+
 -- Perform shard operation
 -- Function will restart operation after wrong bucket response until timeout
 -- is reached
 --
-local function router_call(router, bucket_id, mode, func, args, opts)
+local function router_call_impl(router, bucket_id, mode, prefer_replica,
+                                balance, func, args, opts)
     if opts and (type(opts) ~= 'table' or
                  (opts.timeout and type(opts.timeout) ~= 'number')) then
         error('Usage: call(bucket_id, mode, func, args, opts)')
+    elseif not opts then
+        opts = {}
     end
-    local timeout = opts and opts.timeout or consts.CALL_TIMEOUT_MIN
+    local timeout = opts.timeout or consts.CALL_TIMEOUT_MIN
     local replicaset, err
     local tend = lfiber.time() + timeout
     if bucket_id > router.total_bucket_count or bucket_id <= 0 then
@@ -256,7 +313,17 @@ local function router_call(router, bucket_id, mode, func, args, opts)
     end
     local call
     if mode == 'read' then
-        call = 'callro'
+        if prefer_replica then
+            if balance then
+                call = 'callbre'
+            else
+                call = 'callre'
+            end
+        elseif balance then
+            call = 'callbro'
+        else
+            call = 'callro'
+        end
     else
         call = 'callrw'
     end
@@ -264,18 +331,24 @@ local function router_call(router, bucket_id, mode, func, args, opts)
         replicaset, err = bucket_resolve(router, bucket_id)
         if replicaset then
 ::replicaset_is_found::
+            opts.timeout = tend - lfiber.time()
             local storage_call_status, call_status, call_error =
                 replicaset[call](replicaset, 'vshard.storage.call',
-                                 {bucket_id, mode, func, args},
-                                 {timeout = tend - lfiber.time()})
+                                 {bucket_id, mode, func, args}, opts)
             if storage_call_status then
                 if call_status == nil and call_error ~= nil then
                     return call_status, call_error
-                else
+                elseif not opts.is_async then
                     return call_status
+                else
+                    -- Vshard.storage.call(func) returns two
+                    -- values: true/false and func result. But
+                    -- async returns future object. No true/false
+                    -- nor func result. So return the first value.
+                    return wrap_storage_call_future(storage_call_status)
                 end
             end
-            err = call_status
+            err = lerror.make(call_status)
             if err.code == lerror.code.WRONG_BUCKET or
                err.code == lerror.code.BUCKET_IS_LOCKED then
                 bucket_reset(router, bucket_id)
@@ -343,11 +416,42 @@ end
 -- Wrappers for router_call with preset mode.
 --
 local function router_callro(router, bucket_id, ...)
-    return router_call(router, bucket_id, 'read', ...)
+    return router_call_impl(router, bucket_id, 'read', false, false, ...)
+end
+
+local function router_callbro(router, bucket_id, ...)
+    return router_call_impl(router, bucket_id, 'read', false, true, ...)
 end
 
 local function router_callrw(router, bucket_id, ...)
-    return router_call(router, bucket_id, 'write', ...)
+    return router_call_impl(router, bucket_id, 'write', false, false, ...)
+end
+
+local function router_callre(router, bucket_id, ...)
+    return router_call_impl(router, bucket_id, 'read', true, false, ...)
+end
+
+local function router_callbre(router, bucket_id, ...)
+    return router_call_impl(router, bucket_id, 'read', true, true, ...)
+end
+
+local function router_call(router, bucket_id, opts, ...)
+    local mode, prefer_replica, balance
+    if opts then
+        if type(opts) == 'string' then
+            mode = opts
+        elseif type(opts) == 'table' then
+            mode = opts.mode or 'write'
+            prefer_replica = opts.prefer_replica
+            balance = opts.balance
+        else
+            error('Usage: router.call(bucket_id, shard_opts, func, args, opts)')
+        end
+    else
+        mode = 'write'
+    end
+    return router_call_impl(router, bucket_id, mode, prefer_replica, balance,
+                            ...)
 end
 
 --
@@ -379,12 +483,17 @@ local function failover_ping_round(router)
         local replica = replicaset.replica
         if replica ~= nil and replica.conn ~= nil and
            replica.down_ts == nil then
-            if not replica.conn:ping({timeout = 5}) then
+            if not replica.conn:ping({timeout =
+                                      router.failover_ping_timeout}) then
                 log.info('Ping error from %s: perhaps a connection is down',
                          replica)
                 -- Connection hangs. Recreate it to be able to
-                -- fail over to a replica next by priority.
-                replica.conn:close()
+                -- fail over to a replica next by priority. The
+                -- old connection is not closed in case if it just
+                -- processes too big response at this moment. Any
+                -- way it will be eventually garbage collected
+                -- and closed.
+                replica:detach_conn()
                 replicaset:connect_replica(replica)
             end
         end
@@ -575,6 +684,7 @@ local function router_cfg(router, cfg, is_reload)
     router.collect_lua_garbage = vshard_cfg.collect_lua_garbage
     router.current_cfg = cfg
     router.replicasets = new_replicasets
+    router.failover_ping_timeout = vshard_cfg.failover_ping_timeout
     local old_route_map = router.route_map
     router.route_map = table_new(router.total_bucket_count, 0)
     for bucket, rs in pairs(old_route_map) do
@@ -867,7 +977,10 @@ local router_mt = {
         buckets_info = router_buckets_info;
         call = router_call;
         callro = router_callro;
+        callbro = router_callbro;
         callrw = router_callrw;
+        callre = router_callre;
+        callbre = router_callbre;
         route = router_route;
         routeall = router_routeall;
         bucket_id = router_bucket_id;

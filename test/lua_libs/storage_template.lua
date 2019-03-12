@@ -12,10 +12,14 @@ if not cfg.shard_index then
 end
 
 vshard = require('vshard')
+echo_count = 0
 cfg.replication_connect_timeout = 3
 vshard.storage.cfg(cfg, util.name_to_uuid[NAME])
 function bootstrap_storage(engine)
     box.once("testapp:schema:1", function()
+        if rawget(_G, 'CHANGE_SPACE_IDS') then
+            box.schema.create_space("CHANGE_SPACE_IDS")
+        end
         local format = {{'id', 'unsigned'}, {'bucket_id', 'unsigned'}}
         local s = box.schema.create_space('test', {engine = engine, format = format})
         s:create_index('pk', {parts = {{'id'}}})
@@ -41,11 +45,14 @@ function bootstrap_storage(engine)
         box.schema.role.grant('public', 'execute', 'function', 'raise_luajit_error')
         box.schema.func.create('raise_client_error')
         box.schema.role.grant('public', 'execute', 'function', 'raise_client_error')
+        box.schema.func.create('do_push')
+        box.schema.role.grant('public', 'execute', 'function', 'do_push')
         box.snapshot()
     end)
 end
 
 function echo(...)
+    echo_count = echo_count + 1
     return ...
 end
 
@@ -84,6 +91,11 @@ function check_consistency()
         assert(box.space._bucket:get{tuple.bucket_id})
     end
     return true
+end
+
+function do_push(push, retval)
+    box.session.push(push)
+    return retval
 end
 
 --
