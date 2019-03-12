@@ -387,7 +387,7 @@ local replicaset_mt = {
         down_replica_priority = replicaset_down_replica_priority;
         up_replica_priority = replicaset_up_replica_priority;
         call = replicaset_master_call;
-        callrw = replicaset_master_call;
+        callrw = replicaset_nearest_call;
         callro = replicaset_nearest_call;
     };
     __tostring = replicaset_tostring;
@@ -659,5 +659,5 @@ return {
     calculate_etalon_balance = cluster_calculate_etalon_balance,
     wait_masters_connect = wait_masters_connect,
     rebind_replicasets = rebind_replicasets,
-    outdate_replicasets = outdate_replicasets,
+    outdate_replicasets = outdate_replicasets
 }

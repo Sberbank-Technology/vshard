@@ -4,6 +4,8 @@ local lfiber = require('fiber')
 local netbox = require('net.box') -- for net.box:self()
 local trigger = require('internal.trigger')
 local ffi = require('ffi')
+local table_new = require('table.new')
+local lhash = require('vshard.hash')
 
 local MODULE_INTERNALS = '__module_vshard_storage'
 -- Reload requirements, in case this module is reloaded manually.
@@ -248,6 +250,8 @@ local function storage_schema_v1(username, password)
         'vshard.storage.buckets_discovery',
         'vshard.storage.rebalancer_request_state',
         'vshard.storage.rebalancer_apply_routes',
+		'vshard.storage.broadcast_call',
+		'vshard.storage.call_unknown_bucket'
     }
 
     for _, name in ipairs(storage_api) do
@@ -259,8 +263,8 @@ local function storage_schema_v1(username, password)
 end
 
 local function this_is_master()
-    return M.this_replicaset and M.this_replicaset.master and
-           M.this_replica == M.this_replicaset.master
+    return true--M.this_replicaset and M.this_replicaset.master and
+           --M.this_replica == M.this_replicaset.master
 end
 
 local function on_master_disable(...)
@@ -485,10 +489,10 @@ local function bucket_check_state(bucket_id, mode)
                                          bucket_id, bucket.destination)
         end
         reason = 'write is prohibited'
-    elseif M.this_replicaset.master ~= M.this_replica then
-        return bucket, lerror.vshard(lerror.code.NON_MASTER,
-                                     M.this_replica.uuid,
-                                     M.this_replicaset.uuid)
+    --elseif M.this_replicaset.master ~= M.this_replica then
+    --    return bucket, lerror.vshard(lerror.code.NON_MASTER,
+    --                                 M.this_replica.uuid,
+    --                                 M.this_replicaset.uuid)
     else
         return bucket
     end
@@ -871,7 +875,7 @@ end
 local function local_on_master_disable_prepare()
     log.info("Resigning from the replicaset master role...")
     if not M.current_cfg or M.current_cfg.read_only == nil then
-        box.cfg({read_only = true})
+        box.cfg({read_only = false})
         sync(M.sync_timeout)
     end
 end
@@ -902,7 +906,7 @@ end
 --
 local function local_on_master_enable_abort()
     if not M.current_cfg or M.current_cfg.read_only == nil then
-        box.cfg({read_only = true})
+        box.cfg({read_only = false})
     end
 end
 
@@ -1670,9 +1674,242 @@ local function storage_call(bucket_id, mode, name, args)
     return ok, ret1, ret2, ret3
 end
 
+local function storage_call_unknown_bucket(func, mode, name, args)	
+	local buckets = {}
+	log.info('!!!!!')
+	local ok, err, ret1, ret2, ret3, _
+	ok, ret1, ret2, ret3 = pcall(netbox.self.call, netbox.self, func, args)
+	if not ok then
+		return ok, ret1
+	end
+	for k,v in pairs(ret1) do
+		ok, err, ret1, ret2, ret3, _ = bucket_ref(v[1], mode)
+		if ok then
+			buckets[v[1]] = true
+		else
+			break
+		end
+	end
+	if ok then
+		ok, ret1, ret2, ret3 = pcall(netbox.self.call, netbox.self, name, args)
+	end
+	--log.info('!!!!!'..tostring(ok)..tostring(ret1)..tostring(ret2)..tostring(ret3))
+	for k,v in pairs(buckets) do
+		if v then
+			_, err = bucket_unref(k, mode)
+			if err then
+				log.error('Releasing %s ref for bucket has been failed after %s func: %s', mode, k, name, err)
+			end
+		end
+	end
+    if not ok then
+        ret1 = lerror.make(ret1)
+    end
+	log.info('!!!!!'..tostring(ok)..tostring(ret1)..tostring(ret2)..tostring(ret3))
+    return ok, ret1, ret2, ret3
+end
+
+local function broadcast_storage_call(mode, name, args)
+	local buckets = {}
+	local ok, err, ret1, ret2, ret3, _
+	for k,v in pairs(box.space._bucket:select()) do
+		ok, err, ret1, ret2, ret3, _ = bucket_ref(v[1], mode)
+		if ok then
+			buckets[v[1]] = true
+		else
+			buckets[v[1]] = false
+		end
+	end
+	--log.error('!!11!! %s  %s', table_to_string(table.insert(args, 1, buckets)))
+	table.insert(args, 1, buckets)
+    ok, ret1, ret2, ret3 = pcall(netbox.self.call, netbox.self, name, args)
+	for k,v in pairs(buckets) do
+		if v then
+			_, err = bucket_unref(k, mode)
+			if err then
+				log.error('Releasing %s ref for bucket has been failed after %s func: %s', mode, k, name, err)
+			end
+		end
+	end
+    if not ok then
+        ret1 = lerror.make(ret1)
+    end
+    return ok, ret1, ret2, ret3
+end
+
 --------------------------------------------------------------------------------
 -- Configuration
 --------------------------------------------------------------------------------
+
+local function discovery_f()
+    local module_version = M.module_version
+    while module_version == M.module_version do
+        while not next(M.replicasets) do
+            lfiber.sleep(consts.DISCOVERY_INTERVAL)
+        end
+        local old_replicasets = M.replicasets
+        for rs_uuid, replicaset in pairs(M.replicasets) do
+            local active_buckets, err =
+                replicaset:callro('vshard.storage.buckets_discovery', {},
+                                  {timeout = 2})
+            while M.errinj.ERRINJ_LONG_DISCOVERY do
+                M.errinj.ERRINJ_LONG_DISCOVERY = 'waiting'
+                lfiber.sleep(0.01)
+            end
+            -- Renew replicasets object captured by the for loop
+            -- in case of reconfigure and reload events.
+            if M.replicasets ~= old_replicasets then
+                break
+            end
+            if not active_buckets then
+                log.error('Error during discovery %s: %s', replicaset, err)
+            else
+                if #active_buckets ~= replicaset.bucket_count then
+                    log.info('Updated %s buckets: was %d, became %d',
+                             replicaset, replicaset.bucket_count,
+                             #active_buckets)
+                end
+                replicaset.bucket_count = #active_buckets
+                for _, bucket_id in pairs(active_buckets) do
+                    local old_rs = M.route_map[bucket_id]
+                    if old_rs and old_rs ~= replicaset then
+                        old_rs.bucket_count = old_rs.bucket_count - 1
+                    end
+                    M.route_map[bucket_id] = replicaset
+                end
+            end
+            lfiber.sleep(consts.DISCOVERY_INTERVAL)
+        end
+    end
+end
+
+local function failover_ping_round()
+    for _, replicaset in pairs(M.replicasets) do
+        local replica = replicaset.replica
+        if replica ~= nil and replica.conn ~= nil and
+           replica.down_ts == nil then
+            if not replica.conn:ping({timeout = 5}) then
+                log.info('Ping error from %s: perhaps a connection is down',
+                         replica)
+                -- Connection hangs. Recreate it to be able to
+                -- fail over to a replica next by priority.
+                replica.conn:close()
+                replicaset:connect_replica(replica)
+            end
+        end
+    end
+end
+
+local function failover_need_down_priority(replicaset, curr_ts)
+    local r = replicaset.replica
+    if r and r.down_ts then
+        assert(not r:is_connected())
+    end
+    return r and r.down_ts and
+           curr_ts - r.down_ts >= consts.FAILOVER_DOWN_TIMEOUT
+           and r.next_by_priority
+end
+
+local function failover_need_up_priority(replicaset, curr_ts)
+    local up_ts = replicaset.replica_up_ts
+    return not up_ts or curr_ts - up_ts >= consts.FAILOVER_UP_TIMEOUT
+end
+
+local function failover_collect_to_update()
+    local ts = lfiber.time()
+    local uuid_to_update = {}
+    for uuid, rs in pairs(M.replicasets) do
+        if failover_need_down_priority(rs, ts) or
+           failover_need_up_priority(rs, ts) then
+            table.insert(uuid_to_update, uuid)
+        end
+    end
+    return uuid_to_update
+end
+
+local function failover_step()
+    failover_ping_round()
+    local uuid_to_update = failover_collect_to_update()
+    if #uuid_to_update == 0 then
+        return false
+    end
+    local curr_ts = lfiber.time()
+    local replica_is_changed = false
+    for _, uuid in pairs(uuid_to_update) do
+        local rs = M.replicasets[uuid]
+        if M.errinj.ERRINJ_FAILOVER_CHANGE_CFG then
+            rs = nil
+            M.errinj.ERRINJ_FAILOVER_CHANGE_CFG = false
+        end
+        if rs == nil then
+            log.info('Configuration has changed, restart failovering')
+            lfiber.yield()
+            return true
+        end
+        if not next(rs.replicas) then
+            goto continue
+        end
+        local old_replica = rs.replica
+        if failover_need_up_priority(rs, curr_ts) then
+            rs:up_replica_priority()
+        end
+        if failover_need_down_priority(rs, curr_ts) then
+            rs:down_replica_priority()
+        end
+        if old_replica ~= rs.replica then
+            log.info('New replica %s for %s', rs.replica, rs)
+            replica_is_changed = true
+        end
+::continue::
+    end
+    return replica_is_changed
+end
+
+local function failover_f()
+    local module_version = M.module_version
+    local min_timeout = math.min(consts.FAILOVER_UP_TIMEOUT,
+                                 consts.FAILOVER_DOWN_TIMEOUT)
+    -- This flag is used to avoid logging like:
+    -- 'All is ok ... All is ok ... All is ok ...'
+    -- each min_timeout seconds.
+    local prev_was_ok = false
+    while module_version == M.module_version do
+::continue::
+        local ok, replica_is_changed = pcall(failover_step)
+        if not ok then
+            log.error('Error during failovering: %s',
+                      lerror.make(replica_is_changed))
+            replica_is_changed = true
+        elseif not prev_was_ok then
+            log.info('All replicas are ok')
+        end
+        prev_was_ok = not replica_is_changed
+        local logf
+        if replica_is_changed then
+            logf = log.info
+        else
+            -- In any case it is necessary to periodically log
+            -- failover heartbeat.
+            logf = log.verbose
+        end
+        logf('Failovering step is finished. Schedule next after %f seconds',
+             min_timeout)
+        lfiber.sleep(min_timeout)
+    end
+end
+
+local function find_rebalance_master()
+    local min_master
+    for rs_uuid, rs in pairs(new_replicasets) do
+        for replica_uuid, replica in pairs(rs.replicas) do
+            if (min_master == nil or replica_uuid < min_master.uuid) and
+               rs.master == replica then
+                min_master = replica
+            end
+        end
+    end
+	return min_master
+end
 
 local function storage_cfg(cfg, this_replica_uuid, is_reload)
     if this_replica_uuid == nil then
@@ -1680,9 +1917,9 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
     end
     cfg = lcfg.check(cfg, M.current_cfg)
     local vshard_cfg, box_cfg = lcfg.split(cfg)
-    if vshard_cfg.weights or vshard_cfg.zone then
-        error('Weights and zone are not allowed for storage configuration')
-    end
+    --if vshard_cfg.weights or vshard_cfg.zone then
+    --    error('Weights and zone are not allowed for storage configuration')
+    --end
     if M.replicasets then
         log.info("Starting reconfiguration of replica %s", this_replica_uuid)
     else
@@ -1758,7 +1995,7 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
             end
         end
         if was_master == is_master and box_cfg.read_only == nil then
-            box_cfg.read_only = not is_master
+            box_cfg.read_only = false--not is_master
         end
         if type(box.cfg) == 'function' then
             box_cfg.instance_uuid = box_cfg.instance_uuid or this_replica.uuid
@@ -1799,7 +2036,10 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         local old = box.space._bucket:on_replace()[1]
         box.space._bucket:on_replace(bucket_generation_increment, old)
     end
-
+    for _, replicaset in pairs(new_replicasets) do
+        replicaset:connect_all()
+    end
+    lreplicaset.wait_masters_connect(new_replicasets)
     lreplicaset.rebind_replicasets(new_replicasets, M.replicasets)
     lreplicaset.outdate_replicasets(M.replicasets)
     M.replicasets = new_replicasets
@@ -1814,6 +2054,12 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         vshard_cfg.collect_bucket_garbage_interval
     M.collect_lua_garbage = vshard_cfg.collect_lua_garbage
     M.current_cfg = cfg
+	M.discovery_f = discovery_f
+	M.failover_f = failover_f
+	M.router_name = 'static_router'
+	if M.route_map == nil then
+		M.route_map = {}
+	end
 
     if was_master and not is_master then
         local_on_master_disable()
@@ -1838,9 +2084,224 @@ local function storage_cfg(cfg, this_replica_uuid, is_reload)
         M.rebalancer_fiber:cancel()
         M.rebalancer_fiber = nil
     end
+	local old_route_map = M.route_map
+    M.route_map = table_new(M.total_bucket_count, 0)
+    for bucket, rs in pairs(old_route_map) do
+        local new_rs = M.replicasets[rs.uuid]
+        if new_rs then
+            M.route_map[bucket] = new_rs
+            new_rs.bucket_count = new_rs.bucket_count + 1
+        end
+    end
+    if M.failover_fiber == nil then
+        M.failover_fiber = util.reloadable_fiber_create(
+            'vshard.failover.' .. M.router_name, M, 'failover_f')
+    end
+    if M.discovery_fiber == nil then
+        M.discovery_fiber = util.reloadable_fiber_create(
+            'vshard.discovery.' .. M.router_name, M, 'discovery_f')
+    end
     lua_gc.set_state(M.collect_lua_garbage, consts.COLLECT_LUA_GARBAGE_INTERVAL)
     -- Destroy connections, not used in a new configuration.
     collectgarbage()
+end
+
+local function bucket_set(bucket_id, rs_uuid)
+    local replicaset = M.replicasets[rs_uuid]
+    -- It is technically possible to delete a replicaset at the
+    -- same time when route to the bucket is discovered.
+    if not replicaset then
+        return nil, lerror.vshard(lerror.code.NO_ROUTE_TO_BUCKET, bucket_id)
+    end
+    local old_replicaset = M.route_map[bucket_id]
+    if old_replicaset ~= replicaset then
+        if old_replicaset then
+            old_replicaset.bucket_count = old_replicaset.bucket_count - 1
+        end
+        replicaset.bucket_count = replicaset.bucket_count + 1
+    end
+    M.route_map[bucket_id] = replicaset
+    return replicaset
+end
+
+local function bucket_discovery(bucket_id)
+    local replicaset = M.route_map[bucket_id]
+    if replicaset ~= nil then
+        return replicaset
+    end
+
+    log.verbose("Discovering bucket %d", bucket_id)
+    local last_err = nil
+    local unreachable_uuid = nil
+    for uuid, replicaset in pairs(M.replicasets) do
+        local _, err =
+            replicaset:callrw('vshard.storage.bucket_stat', {bucket_id})
+        if err == nil then
+            return bucket_set(bucket_id, replicaset.uuid)
+        elseif err.code ~= lerror.code.WRONG_BUCKET then
+            last_err = err
+            unreachable_uuid = uuid
+        end
+    end
+    local err = nil
+    if last_err then
+        if last_err.type == 'ClientError' and
+           last_err.code == box.error.NO_CONNECTION then
+            err = lerror.vshard(lerror.code.UNREACHABLE_REPLICASET,
+                                unreachable_uuid, bucket_id)
+        else
+            err = lerror.make(last_err)
+        end
+    else
+        -- All replicasets were scanned, but a bucket was not
+        -- found anywhere, so most likely it does not exist. It
+        -- can be wrong, if rebalancing is in progress, and a
+        -- bucket was found to be RECEIVING on one replicaset, and
+        -- was not found on other replicasets (it was sent during
+        -- discovery).
+        err = lerror.vshard(lerror.code.NO_ROUTE_TO_BUCKET, bucket_id)
+    end
+
+    return nil, err
+end
+
+local function bucket_resolve(bucket_id)
+    local replicaset, err
+    local replicaset = M.route_map[bucket_id]
+    if replicaset ~= nil then
+        return replicaset
+    end
+    -- Replicaset removed from cluster, perform discovery
+    replicaset, err = bucket_discovery(bucket_id)
+    if replicaset == nil then
+        return nil, err
+    end
+    return replicaset
+end
+
+local function bucket_reset(bucket_id)
+    local replicaset = M.route_map[bucket_id]
+    if replicaset then
+        replicaset.bucket_count = replicaset.bucket_count - 1
+    end
+    M.route_map[bucket_id] = nil
+end
+
+local function router_call(bucket_id, mode, func, args, opts)
+    if opts and (type(opts) ~= 'table' or
+                 (opts.timeout and type(opts.timeout) ~= 'number')) then
+        error('Usage: call(bucket_id, mode, func, args, opts)')
+    end
+    local timeout = opts and opts.timeout or consts.CALL_TIMEOUT_MIN
+    local replicaset, err
+    local tend = lfiber.time() + timeout
+    if bucket_id > M.total_bucket_count or bucket_id <= 0 then
+        error('Bucket is unreachable: bucket id is out of range')
+    end
+    local call
+    if mode == 'read' then
+        call = 'callro'
+    else
+        call = 'callrw'
+    end
+    repeat
+        replicaset, err = bucket_resolve(bucket_id)
+        if replicaset then
+::replicaset_is_found::
+			local storage_call_status, call_status, call_error
+			if replicaset.uuid == box.cfg.replicaset_uuid then
+				storage_call_status, call_status, call_error =
+					storage_call(bucket_id, mode, func, args)
+			else
+				storage_call_status, call_status, call_error =
+					replicaset[call](replicaset, 'vshard.storage.call',
+                                 {bucket_id, mode, func, args},
+                                 {timeout = tend - lfiber.time()})
+			end
+            if storage_call_status then
+                if call_status == nil and call_error ~= nil then
+                    return call_status, call_error
+                else
+                    return call_status
+                end
+            end
+            err = call_status
+            if err.code == lerror.code.WRONG_BUCKET or
+               err.code == lerror.code.BUCKET_IS_LOCKED then
+                bucket_reset(bucket_id)
+                if err.destination then
+                    replicaset = M.replicasets[err.destination]
+                    if not replicaset then
+                        log.warn('Replicaset "%s" was not found, but received'..
+                                 ' from storage as destination - please '..
+                                 'update configuration', err.destination)
+                        -- Try to wait until the destination
+                        -- appears. A destination can disappear,
+                        -- if reconfiguration had been started,
+                        -- and while is not executed on router,
+                        -- but already is executed on storages.
+                        while lfiber.time() <= tend do
+                            lfiber.sleep(0.05)
+                            replicaset = M.replicasets[err.destination]
+                            if replicaset then
+                                goto replicaset_is_found
+                            end
+                        end
+                    else
+                        replicaset = bucket_set(bucket_id,
+                                                replicaset.uuid)
+                        lfiber.yield()
+                        -- Protect against infinite cycle in a
+                        -- case of broken cluster, when a bucket
+                        -- is sent on two replicasets to each
+                        -- other.
+                        if replicaset and lfiber.time() <= tend then
+                            goto replicaset_is_found
+                        end
+                    end
+                    return nil, err
+                end
+            elseif err.code == lerror.code.TRANSFER_IS_IN_PROGRESS then
+                -- Do not repeat write requests, even if an error
+                -- is not timeout - these requests are repeated in
+                -- any case on client, if error.
+                assert(mode == 'write')
+                bucket_reset(bucket_id)
+                return nil, err
+            elseif err.code == lerror.code.NON_MASTER then
+                -- Same, as above - do not wait and repeat.
+                assert(mode == 'write')
+                log.warn("Replica %s is not master for replicaset %s anymore,"..
+                         "please update configuration!",
+                          replicaset.master.uuid, replicaset.uuid)
+                return nil, err
+            else
+                return nil, err
+            end
+        end
+        lfiber.yield()
+    until lfiber.time() > tend
+    if err then
+        return nil, err
+    else
+        local _, boxerror = pcall(box.error, box.error.TIMEOUT)
+        return nil, lerror.box(boxerror)
+    end
+end
+
+local function storage_bucket_id(key)
+    if key == nil then
+        error("Usage: bucket_id(key)")
+    end
+    return lhash.key_hash(key) % M.total_bucket_count + 1
+end
+
+local function router_callro(bucket_id, ...)
+    return router_call(bucket_id, 'read', ...)
+end
+
+local function router_callrw(bucket_id, ...)
+    return router_call(bucket_id, 'write', ...)
 end
 
 --------------------------------------------------------------------------------
@@ -2099,10 +2560,16 @@ return {
     rebalancer_apply_routes = rebalancer_apply_routes,
     rebalancer_disable = rebalancer_disable,
     rebalancer_enable = rebalancer_enable,
+    find_rebalance_master = find_rebalance_master,
     is_locked = is_this_replicaset_locked,
     rebalancing_is_in_progress = rebalancing_is_in_progress,
     recovery_wakeup = recovery_wakeup,
     call = storage_call,
+    broadcast_call = broadcast_storage_call,
+    call_unknown_bucket = storage_call_unknown_bucket,
+    router_call = router_call,
+    router_callro = router_callro,
+    router_callrw = router_callrw,
     cfg = function(cfg, uuid) return storage_cfg(cfg, uuid, false) end,
     info = storage_info,
     buckets_info = storage_buckets_info,
@@ -2112,6 +2579,8 @@ return {
     internal = M,
     on_master_enable = on_master_enable,
     on_master_disable = on_master_disable,
+	bucket_id = storage_bucket_id,
+	bucket_check_state = bucket_check_state,
     sharded_spaces = function()
         return table.deepcopy(find_sharded_spaces())
     end,
