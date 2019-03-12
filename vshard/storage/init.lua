@@ -327,7 +327,10 @@ end
 local function recovery_step_by_type(type)
     local _bucket = box.space._bucket
     local is_empty = true
+    local recovered = 0
+    local total = 0
     for _, bucket in _bucket.index.status:pairs(type) do
+        total = total + 1
         local bucket_id = bucket.id
         if M.rebalancer_transfering_buckets[bucket_id] then
             goto continue
@@ -364,13 +367,16 @@ local function recovery_step_by_type(type)
         end
         if recovery_local_bucket_is_garbage(bucket, remote_bucket) then
             _bucket:update({bucket_id}, {{'=', 2, consts.BUCKET.GARBAGE}})
+            recovered = recovered + 1
         elseif recovery_local_bucket_is_active(bucket, remote_bucket) then
             _bucket:replace({bucket_id, consts.BUCKET.ACTIVE})
+            recovered = recovered + 1
         end
 ::continue::
     end
     if not is_empty then
-        log.info('Finish bucket recovery step')
+        log.info('Finish bucket recovery step, %d %s buckets are recovered '..
+                 'among %d', recovered, type, total)
     end
 end
 
@@ -693,7 +699,7 @@ end
 -- @param bucket_id Bucket to receive.
 -- @param from Source UUID.
 -- @param data Bucket data in the format:
---        [{space_id, [space_tuples]}, ...].
+--        [{space_name, [space_tuples]}, ...].
 -- @param opts Options. Now the only possible option is 'is_last'.
 --        It is set to true when the data portion is last and the
 --        bucket can be activated here.
@@ -726,13 +732,13 @@ local function bucket_recv_xc(bucket_id, from, data, opts)
     local bucket_generation = M.bucket_generation
     local limit = consts.BUCKET_CHUNK_SIZE
     for _, row in ipairs(data) do
-        local space_id, space_data = row[1], row[2]
-        local space = box.space[space_id]
+        local space_name, space_data = row[1], row[2]
+        local space = box.space[space_name]
         if space == nil then
             -- Tarantool doesn't provide API to create box.error
             -- objects before 1.10.
             local _, boxerror = pcall(box.error, box.error.NO_SUCH_SPACE,
-                                      space_id)
+                                      space_name)
             return nil, lerror.box(boxerror)
         end
         box.begin()
@@ -833,7 +839,7 @@ local function bucket_collect(bucket_id)
     for k, space in pairs(spaces) do
         assert(space.index[idx] ~= nil)
         local space_data = space.index[idx]:select({bucket_id})
-        table.insert(data, {space.id, space_data})
+        table.insert(data, {space.name, space_data})
     end
     return data
 end
@@ -966,7 +972,7 @@ local function bucket_send_xc(bucket_id, destination, opts)
             table.insert(space_data, t)
             limit = limit - 1
             if limit == 0 then
-                table.insert(data, {space.id, space_data})
+                table.insert(data, {space.name, space_data})
                 status, err = replicaset:callrw('vshard.storage.bucket_recv',
                                                 {bucket_id, uuid, data}, opts)
                 bucket_generation =
@@ -980,7 +986,7 @@ local function bucket_send_xc(bucket_id, destination, opts)
                 space_data = {}
             end
         end
-        table.insert(data, {space.id, space_data})
+        table.insert(data, {space.name, space_data})
     end
     status, err = replicaset:callrw('vshard.storage.bucket_recv',
                                     {bucket_id, uuid, data}, opts)
@@ -999,7 +1005,11 @@ local function bucket_send_xc(bucket_id, destination, opts)
         return status, lerror.make(err)
     end
     _bucket:replace({bucket_id, consts.BUCKET.SENT, destination})
-    M.bucket_refs[bucket_id].ro_lock = true
+    -- Replace yields and GC may manage to drop the ref.
+    local ref = M.bucket_refs[bucket_id]
+    if ref then
+        ref.ro_lock = true
+    end
     return true
 end
 
@@ -1338,12 +1348,10 @@ end
 --     uuid = {bucket_count = number, weight = number},
 --     ...
 -- }
--- @param max_receiving Maximal bucket count that can be received
---        in parallel by a single master.
 --
 -- @retval Maximal disbalance over all replicasets.
 --
-local function rebalancer_calculate_metrics(replicasets, max_receiving)
+local function rebalancer_calculate_metrics(replicasets)
     local max_disbalance = 0
     for _, replicaset in pairs(replicasets) do
         local needed = replicaset.etalon_bucket_count - replicaset.bucket_count
@@ -1357,7 +1365,7 @@ local function rebalancer_calculate_metrics(replicasets, max_receiving)
             max_disbalance = math.huge
         end
         assert(needed >= 0 or -needed <= replicaset.bucket_count)
-        replicaset.needed = math.min(max_receiving, needed)
+        replicaset.needed = needed
     end
     return max_disbalance
 end
@@ -1366,8 +1374,12 @@ end
 -- Move @a needed bucket count from a pool to @a dst_uuid and
 -- remember the route in @a bucket_routes table.
 --
+-- @param max_receiving Maximal bucket count that can be received
+--        in parallel by a single master.
+--
 local function rebalancer_take_buckets_from_pool(bucket_pool, bucket_routes,
-                                                 dst_uuid, needed)
+                                                 dst_uuid, needed,
+                                                 max_receiving)
     local to_remove_from_pool = {}
     for src_uuid, bucket_count in pairs(bucket_pool) do
         local count = math.min(bucket_count, needed)
@@ -1388,7 +1400,8 @@ local function rebalancer_take_buckets_from_pool(bucket_pool, bucket_routes,
         if new_count == 0 then
             table.insert(to_remove_from_pool, src_uuid)
         end
-        if needed == 0 then
+        max_receiving = max_receiving - 1
+        if needed == 0 or max_receiving == 0 then
             break
         end
     end
@@ -1408,6 +1421,9 @@ end
 -- }      This parameter is a result of
 --        rebalancer_calculate_metrics().
 --
+-- @param max_receiving Maximal bucket count that can be received
+--        in parallel by a single master.
+--
 -- @retval Bucket routes. It is a map of type: {
 --     src_uuid = {
 --         dst_uuid = number, -- Bucket count to move from
@@ -1417,7 +1433,7 @@ end
 --     ...
 -- }
 --
-local function rebalancer_build_routes(replicasets)
+local function rebalancer_build_routes(replicasets, max_receiving)
     -- Map of type: {
     --     uuid = number, -- free buckets of uuid.
     -- }
@@ -1432,7 +1448,7 @@ local function rebalancer_build_routes(replicasets)
     for uuid, replicaset in pairs(replicasets) do
         if replicaset.needed > 0 then
             rebalancer_take_buckets_from_pool(bucket_pool, bucket_routes, uuid,
-                                              replicaset.needed)
+                                              replicaset.needed, max_receiving)
         end
     end
     return bucket_routes
@@ -1555,16 +1571,15 @@ local function rebalancer_f()
         end
         lreplicaset.calculate_etalon_balance(replicasets,
                                              total_bucket_active_count)
-        local max_disbalance =
-            rebalancer_calculate_metrics(replicasets,
-                                         M.rebalancer_max_receiving)
+        local max_disbalance = rebalancer_calculate_metrics(replicasets)
         if max_disbalance <= M.rebalancer_disbalance_threshold then
             log.info('The cluster is balanced ok. Schedule next rebalancing '..
                      'after %f seconds', consts.REBALANCER_IDLE_INTERVAL)
             lfiber.sleep(consts.REBALANCER_IDLE_INTERVAL)
             goto continue
         end
-        local routes = rebalancer_build_routes(replicasets)
+        local routes = rebalancer_build_routes(replicasets,
+                                               M.rebalancer_max_receiving)
         -- Routes table can not be empty. If it had been empty,
         -- then max_disbalance would have been calculated
         -- incorrectly.

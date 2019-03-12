@@ -26,6 +26,8 @@
 --      },
 --      master = <master server from the array above>,
 --      replica = <nearest available replica object>,
+--      balance_i = <index of a next replica in priority_list to
+--                   use for a load-balanced request>,
 --      replica_up_ts = <timestamp updated on each attempt to
 --                       connect to the nearest replica, and on
 --                       each connect event>,
@@ -225,18 +227,18 @@ end
 -- @retval false, ... Response is not received. It can be timeout
 --         or unexpectedly closed connection.
 --
-local function replica_call(replica, func, args, timeout)
-    assert(timeout)
+local function replica_call(replica, func, args, opts)
+    assert(opts and opts.timeout)
     local conn = replica.conn
     local net_status, storage_status, retval, error_object =
-        pcall(conn.call, conn, func, args, {timeout = timeout})
+        pcall(conn.call, conn, func, args, opts)
     if not net_status then
         -- Do not increase replica's network timeout, if the
         -- requested one was less, than network's one. For
         -- example, if replica's timeout was 30s, but an user
         -- specified 1s and it was expired, then there is no
         -- reason to increase network timeout.
-        if timeout >= replica.net_timeout then
+        if opts.timeout >= replica.net_timeout then
             replica_on_failed_request(replica)
         end
         log.error("Exception during calling '%s' on '%s': %s", func, replica,
@@ -253,6 +255,32 @@ local function replica_call(replica, func, args, timeout)
 end
 
 --
+-- Detach the connection object from its replica object.
+-- Detachment means that the connection is not closed, but all its
+-- links with the replica are teared. All current requests are
+-- finished, but next calls on this replica are processed by
+-- another connection.
+-- Initially this function is intended for failover, which should
+-- not close the old connection in case if it receives a huge
+-- response and because of it ignores pings.
+--
+local function replica_detach_conn(replica)
+    local c = replica.conn
+    if c ~= nil then
+        -- The connection now has nothing to do with the replica
+        -- object. In particular, it shall not touch up and down
+        -- ts.
+        c:on_connect(nil, netbox_on_connect)
+        c:on_disconnect(nil, netbox_on_disconnect)
+        -- Detach looks like disconnect for an observer.
+        netbox_on_disconnect(c)
+        c.replica = nil
+        c.replicaset = nil
+        replica.conn = nil
+    end
+end
+
+--
 -- Call a function on remote storage
 -- Note: this function uses pcall-style error handling
 -- @retval false, err on error
@@ -266,9 +294,13 @@ local function replicaset_master_call(replicaset, func, args, opts)
     if not conn then
         return nil, err
     end
-    local timeout = opts and opts.timeout or replicaset.master.net_timeout
+    if not opts then
+        opts = {timeout = replicaset.master.net_timeout}
+    elseif not opts.timeout then
+        opts.timeout = replicaset.master.net_timeout
+    end
     local net_status, storage_status, retval, error_object =
-        replica_call(replicaset.master, func, args, timeout)
+        replica_call(replicaset.master, func, args, opts)
     -- Ignore net_status - master does not retry requests.
     return storage_status, retval, error_object
 end
@@ -290,45 +322,90 @@ local function can_retry_after_error(e)
 end
 
 --
--- Call a function on a nearest available replica. It is possible
+-- Pick a next replica according to round-robin load balancing
+-- policy.
+--
+local function replicaset_balance_replica(replicaset)
+    local i = replicaset.balance_i
+    local pl = replicaset.priority_list
+    local size = #pl
+    replicaset.balance_i = i % size + 1
+    assert(i <= size)
+    return pl[i]
+end
+
+--
+-- Template to implement a function able to visit multiple
+-- replicas with certain details. One of applicatinos - a function
+-- making a call on a nearest available replica. It is possible
 -- for 'read' requests only. And if the nearest replica is not
 -- available now, then use master's connection - we can not wait
 -- until failover fiber will repair the nearest connection.
 --
-local function replicaset_nearest_call(replicaset, func, args, opts)
-    assert(opts == nil or type(opts) == 'table')
-    assert(type(func) == 'string', 'function name')
-    assert(args == nil or type(args) == 'table', 'function arguments')
-    local timeout = opts and opts.timeout or consts.CALL_TIMEOUT_MAX
-    local net_status, storage_status, retval, error_object
-    local end_time = fiber.time() + timeout
-    while not net_status and timeout > 0 do
-        local replica = replicaset.replica
-        local conn
-        if replica and replica:is_connected() then
-            conn = replica.conn
-        else
-            conn, error_object = replicaset_connect_master(replicaset)
-            if not conn then
-                return nil, error_object
+local function replicaset_template_multicallro(prefer_replica, balance)
+    local function pick_next_replica(replicaset)
+        local r
+        local master = replicaset.master
+        if balance then
+            local i = #replicaset.priority_list
+            while i > 0 do
+                r = replicaset_balance_replica(replicaset)
+                i = i - 1
+                if r:is_connected() and (not prefer_replica or r ~= master) then
+                    return r
+                end
             end
-            replica = replicaset.master
+        elseif prefer_replica then
+            r = replicaset.replica
+            while r do
+                if r:is_connected() and r ~= master then
+                    return r
+                end
+                r = r.next_by_priority
+            end
+        else
+            r = replicaset.replica
+            if r and r:is_connected() then
+                return r
+            end
         end
-        net_status, storage_status, retval, error_object =
-            replica_call(replica, func, args, timeout)
-        timeout = end_time - fiber.time()
-        if not net_status and not storage_status and
-           not can_retry_after_error(retval) then
-            -- There is no sense to retry LuaJit errors, such as
-            -- assetions, not defined variables etc.
-            net_status = true
-            break
+        local conn, err = replicaset_connect_master(replicaset)
+        if not conn then
+            return nil, err
         end
+        return master
     end
-    if not net_status then
-        return nil, lerror.make(retval)
-    else
-        return storage_status, retval, error_object
+
+    return function(replicaset, func, args, opts)
+        assert(opts == nil or type(opts) == 'table')
+        assert(type(func) == 'string', 'function name')
+        assert(args == nil or type(args) == 'table', 'function arguments')
+        opts = opts or {}
+        local timeout = opts.timeout or consts.CALL_TIMEOUT_MAX
+        local net_status, storage_status, retval, err
+        local end_time = fiber.time() + timeout
+        while not net_status and timeout > 0 do
+            local replica, err = pick_next_replica(replicaset)
+            if not replica then
+                return nil, err
+            end
+            opts.timeout = timeout
+            net_status, storage_status, retval, err =
+                replica_call(replica, func, args, opts)
+            timeout = end_time - fiber.time()
+            if not net_status and not storage_status and
+               not can_retry_after_error(retval) then
+                -- There is no sense to retry LuaJit errors, such as
+                -- assetions, not defined variables etc.
+                net_status = true
+                break
+            end
+        end
+        if not net_status then
+            return nil, lerror.make(retval)
+        else
+            return storage_status, retval, err
+        end
     end
 end
 
@@ -388,7 +465,10 @@ local replicaset_mt = {
         up_replica_priority = replicaset_up_replica_priority;
         call = replicaset_master_call;
         callrw = replicaset_master_call;
-        callro = replicaset_nearest_call;
+        callro = replicaset_template_multicallro(false, false);
+        callbro = replicaset_template_multicallro(false, true);
+        callre = replicaset_template_multicallro(true, false);
+        callbre = replicaset_template_multicallro(true, true);
     };
     __tostring = replicaset_tostring;
 }
@@ -411,6 +491,7 @@ local replica_mt = {
             uri.password = nil
             return luri.format(uri)
         end,
+        detach_conn = replica_detach_conn,
     },
     __tostring = function(replica)
         if replica.name then
@@ -587,6 +668,7 @@ local function buildall(sharding_cfg)
             weight = replicaset.weight,
             bucket_count = 0,
             lock = replicaset.lock,
+            balance_i = 1,
         }, replicaset_mt)
         local priority_list = {}
         for replica_uuid, replica in pairs(replicaset.replicas) do

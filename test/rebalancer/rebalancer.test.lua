@@ -7,8 +7,8 @@ engine = test_run:get_cfg('engine')
 test_run:create_cluster(REPLICASET_1, 'rebalancer')
 test_run:create_cluster(REPLICASET_2, 'rebalancer')
 util = require('util')
-util.wait_master(test_run, REPLICASET_1, 'box_1_a')
-util.wait_master(test_run, REPLICASET_2, 'box_2_a')
+test_run:wait_fullmesh(REPLICASET_1)
+test_run:wait_fullmesh(REPLICASET_2)
 util.map_evals(test_run, {REPLICASET_1, REPLICASET_2}, 'bootstrap_storage(\'%s\')', engine)
 
 --
@@ -227,6 +227,13 @@ while _bucket.index.status:count{vshard.consts.BUCKET.ACTIVE} ~= 200 do
 	vshard.storage.rebalancer_wakeup()
 end;
 test_run:cmd("setopt delimiter ''");
+
+-- gh-152: ensure that rebalancing is possible in case spaces
+-- have different ids on different replicasets.
+test_run:switch('box_1_a')
+box.space.test.id
+test_run:switch('box_2_a')
+box.space.test.id
 
 _ = test_run:cmd("switch default")
 test_run:drop_cluster(REPLICASET_2)
