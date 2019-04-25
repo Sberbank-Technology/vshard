@@ -140,6 +140,8 @@ if not M then
         -- reload to determine which upgrade scripts to run.
         reload_version = reload_evolution.version,
     }
+else
+    bucket_ref_new = ffi.typeof("struct bucket_ref")
 end
 
 --
