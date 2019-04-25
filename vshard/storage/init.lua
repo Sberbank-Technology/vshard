@@ -2204,12 +2204,61 @@ local function bucket_reset(bucket_id)
     M.route_map[bucket_id] = nil
 end
 
-local function router_call(bucket_id, mode, func, args, opts)
+--
+-- Since 1.10 netbox supports flag 'is_async'. Given this flag, a
+-- request result is returned immediately in a form of a future
+-- object. Future of CALL request returns a result wrapped into an
+-- array instead of unpacked values because unpacked values can
+-- not be stored anywhere.
+--
+-- Vshard.router.call calls a user function not directly, but via
+-- vshard.storage.call which returns true/false, result, errors.
+-- So vshard.router.call should wrap a future object with its own
+-- unpacker of result.
+--
+-- Unpack a result given from a future object from
+-- vshard.storage.call. If future returns [status, result, ...]
+-- this function returns [result]. Or a classical couple
+-- nil, error.
+--
+function future_storage_call_result(self)
+    local res, err = self:base_result()
+    if not res then
+        return nil, err
+    end
+    local storage_call_status, call_status, call_error = unpack(res)
+    if storage_call_status then
+        if call_status == nil and call_error ~= nil then
+            return call_status, call_error
+        else
+            return setmetatable({call_status}, seq_serializer)
+        end
+    end
+    return nil, call_status
+end
+
+--
+-- Given a netbox future object, redefine its 'result' method.
+-- It is impossible to just create a new signle metatable per
+-- the module as a copy of original future's one because it has
+-- some upvalues related to the netbox connection.
+--
+local function wrap_storage_call_future(future)
+    -- Base 'result' below is got from __index metatable under the
+    -- hood. But __index is used only when a table has no such a
+    -- member in itself. So via adding 'result' as a member to a
+    -- future object its __index.result can be redefined.
+    future.base_result = future.result
+    future.result = future_storage_call_result
+    return future
+end
+
+local function router_call_impl(bucket_id, mode, prefer_replica, balance, func, args, opts)
     if opts and (type(opts) ~= 'table' or
                  (opts.timeout and type(opts.timeout) ~= 'number')) then
         error('Usage: call(bucket_id, mode, func, args, opts)')
     end
-    local timeout = opts and opts.timeout or consts.CALL_TIMEOUT_MIN
+    local timeout = opts.timeout or consts.CALL_TIMEOUT_MIN
     local replicaset, err
     local tend = lfiber.time() + timeout
     if bucket_id > M.total_bucket_count or bucket_id <= 0 then
@@ -2217,7 +2266,17 @@ local function router_call(bucket_id, mode, func, args, opts)
     end
     local call
     if mode == 'read' then
-        call = 'callro'
+        if prefer_replica then
+            if balance then
+                call = 'callbre'
+            else
+                call = 'callre'
+            end
+        elseif balance then
+            call = 'callbro'
+        else
+            call = 'callro'
+        end
     else
         call = 'callrw'
     end
@@ -2225,21 +2284,21 @@ local function router_call(bucket_id, mode, func, args, opts)
         replicaset, err = bucket_resolve(bucket_id)
         if replicaset then
 ::replicaset_is_found::
-			local storage_call_status, call_status, call_error
-			if replicaset.uuid == box.cfg.replicaset_uuid then
-				storage_call_status, call_status, call_error =
-					storage_call(bucket_id, mode, func, args)
-			else
-				storage_call_status, call_status, call_error =
-					replicaset[call](replicaset, 'vshard.storage.call',
-                                 {bucket_id, mode, func, args},
-                                 {timeout = tend - lfiber.time()})
-			end
+			opts.timeout = tend - lfiber.time()
+			local storage_call_status, call_status, call_error = 
+				replicaset[call](replicaset, 'vshard.storage.call',
+                                 {bucket_id, mode, func, args}, opts)
             if storage_call_status then
                 if call_status == nil and call_error ~= nil then
                     return call_status, call_error
-                else
+                elseif not opts.is_async then
                     return call_status
+				else
+					-- Vshard.storage.call(func) returns two
+                    -- values: true/false and func result. But
+                    -- async returns future object. No true/false
+                    -- nor func result. So return the first value.
+                    return wrap_storage_call_future(storage_call_status)
                 end
             end
             err = call_status
@@ -2306,6 +2365,72 @@ local function router_call(bucket_id, mode, func, args, opts)
     end
 end
 
+local function router_call_broadcast(mode, prefer_replica,
+                                balance, func, args, opts)
+    if opts and (type(opts) ~= 'table' or
+                 (opts.timeout and type(opts.timeout) ~= 'number')) then
+        error('Usage: call(bucket_id, mode, func, args, opts)')
+    elseif not opts then
+        opts = {}
+    end
+    local timeout = opts.timeout or consts.CALL_TIMEOUT_MIN
+    local tend = lfiber.time() + timeout
+    local call
+    if mode == 'read' then
+        if prefer_replica then
+            if balance then
+                call = 'callbre'
+            else
+                call = 'callre'
+            end
+        elseif balance then
+            call = 'callbro'
+        else
+            call = 'callro'
+        end
+    else
+        call = 'callrw'
+    end
+	opts.is_async = true
+	local answers = {}
+	for k, replicaset in pairs(M.replicasets) do
+		local storage_call_status, call_status, call_error =
+			replicaset[call](replicaset, 'vshard.storage.broadcast_call',
+							 {mode, func, args}, opts)
+		answers[k] = wrap_storage_call_future(storage_call_status)
+	end
+	local result = {}
+	local res = true
+    repeat
+		res = true
+        for k, answer in pairs(answers) do
+			if not answer:is_ready() then
+				res = false
+			end
+		end
+        lfiber.yield()
+    until (lfiber.time() > tend) or res
+	for k, answer in pairs(answers) do
+		if answer:is_ready() then
+			if answer:base_result()[1] then
+                if answer:base_result()[2] == nil and answer:base_result()[3] ~= nil then
+                    log.error(answer:base_result()[2])
+                else
+                    result[k] = answer:base_result()[2]
+                end
+			else
+				local err = lerror.make(answer:base_result()[2])
+				log.error(err)
+            end
+		else
+			local _, boxerror = pcall(box.error, box.error.TIMEOUT)
+			log.error(boxerror)
+			answer:discard()
+		end
+	end
+	return result, nil
+end
+
 local function storage_bucket_id(key)
     if key == nil then
         error("Usage: bucket_id(key)")
@@ -2313,12 +2438,23 @@ local function storage_bucket_id(key)
     return lhash.key_hash(key) % M.total_bucket_count + 1
 end
 
-local function router_callro(bucket_id, ...)
-    return router_call(bucket_id, 'read', ...)
-end
-
-local function router_callrw(bucket_id, ...)
-    return router_call(bucket_id, 'write', ...)
+local function router_call(bucket_id, opts, ...)
+    local mode, prefer_replica, balance
+    if opts then
+        if type(opts) == 'string' then
+            mode = opts
+        elseif type(opts) == 'table' then
+            mode = opts.mode or 'write'
+            prefer_replica = opts.prefer_replica
+            balance = opts.balance
+        else
+            error('Usage: router.call(bucket_id, shard_opts, func, args, opts)')
+        end
+    else
+        mode = 'write'
+    end
+    return router_call_impl(bucket_id, mode, prefer_replica, balance,
+                            ...)
 end
 
 --------------------------------------------------------------------------------
@@ -2585,8 +2721,7 @@ return {
     broadcast_call = broadcast_storage_call,
     call_unknown_bucket = storage_call_unknown_bucket,
     router_call = router_call,
-    router_callro = router_callro,
-    router_callrw = router_callrw,
+	router_call_broadcast = router_call_broadcast,
     cfg = function(cfg, uuid) return storage_cfg(cfg, uuid, false) end,
     info = storage_info,
     buckets_info = storage_buckets_info,

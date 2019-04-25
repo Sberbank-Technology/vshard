@@ -454,6 +454,74 @@ local function router_call(router, bucket_id, opts, ...)
                             ...)
 end
 
+local function router_call_broadcast(router, mode, prefer_replica,
+                                balance, func, args, opts)
+    if opts and (type(opts) ~= 'table' or
+                 (opts.timeout and type(opts.timeout) ~= 'number')) then
+        error('Usage: call(bucket_id, mode, func, args, opts)')
+    elseif not opts then
+        opts = {}
+    end
+    local timeout = opts.timeout or consts.CALL_TIMEOUT_MIN
+    local tend = lfiber.time() + timeout
+    local call
+    if mode == 'read' then
+        if prefer_replica then
+            if balance then
+                call = 'callbre'
+            else
+                call = 'callre'
+            end
+        elseif balance then
+            call = 'callbro'
+        else
+            call = 'callro'
+        end
+    else
+        call = 'callrw'
+    end
+	opts.is_async = true
+	local answers = {}
+	for k, replicaset in pairs(router.replicasets) do
+		if not (__module_vshard_storage.current_cfg and opts.skip_this_replicaset and M.this_replicaset.uuid == replicaset.uuid) then
+			local storage_call_status, call_status, call_error =
+				replicaset[call](replicaset, 'vshard.storage.broadcast_call',
+								 {mode, func, args}, opts)
+			answers[k] = wrap_storage_call_future(storage_call_status)
+		end
+	end
+	local result = {}
+	local res = true
+    repeat
+		res = true
+        for k, answer in pairs(answers) do
+			if not answer:is_ready() then
+				res = false
+			end
+		end
+        lfiber.yield()
+    until (lfiber.time() > tend) or res
+	for k, answer in pairs(answers) do
+		if answer:is_ready() then
+			if answer:base_result()[1] then
+                if answer:base_result()[2] == nil and answer:base_result()[3] ~= nil then
+                    log.error(answer:base_result()[2])
+                else
+                    result[k] = answer:base_result()[2]
+                end
+			else
+				local err = lerror.make(answer:base_result()[2])
+				log.error(err)
+            end
+		else
+			local _, boxerror = pcall(box.error, box.error.TIMEOUT)
+			log.error(boxerror)
+			answer:discard()
+		end
+	end
+	return result, nil
+end
+
 --
 -- Get replicaset object by bucket identifier.
 -- @param bucket_id Bucket identifier.
@@ -981,6 +1049,7 @@ local router_mt = {
         callrw = router_callrw;
         callre = router_callre;
         callbre = router_callbre;
+		call_broadcast = router_call_broadcast;
         route = router_route;
         routeall = router_routeall;
         bucket_id = router_bucket_id;
